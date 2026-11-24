@@ -55,6 +55,7 @@ private:
 
     ComputePass::SharedPtr mpPrepareSurfaceData;
     ComputePass::SharedPtr mpFinalShading;
+    Texture::SharedPtr mpDirectGuideWeights;
 
     int mNumReSTIRInstances = 1;
     bool mNeedRecreateReSTIRInstances = false;

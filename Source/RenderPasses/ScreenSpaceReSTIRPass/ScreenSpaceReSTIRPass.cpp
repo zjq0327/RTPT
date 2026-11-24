@@ -28,6 +28,8 @@ namespace
 
     const Falcor::ChannelList kOutputChannels =
     {
+        { "directDiffuseRadianceHitDist", "gDirectDiffuseRadianceHitDist", "Diffuse direct radiance and light distance", true, ResourceFormat::RGBA32Float },
+        { "directSpecularRadianceHitDist", "gDirectSpecularRadianceHitDist", "Specular direct radiance and light distance", true, ResourceFormat::RGBA32Float },
         { "color",                  "gColor",                   "Final color",              true /* optional */, ResourceFormat::RGBA32Float },
         { "emission",               "gEmission",                "Emissive color",           true /* optional */, ResourceFormat::RGBA32Float },
         { "diffuseIllumination",    "gDiffuseIllumination",     "Diffuse illumination",     true /* optional */, ResourceFormat::RGBA32Float },
@@ -297,6 +299,13 @@ void ScreenSpaceReSTIRPass::finalShading(RenderContext* pRenderContext, const Te
 
     // Bind output channels as UAV buffers.
     var = mpFinalShading->getRootVar();
+    if (mNumReSTIRInstances > 1 && (renderData["directDiffuseRadianceHitDist"] || renderData["directSpecularRadianceHitDist"]))
+    {
+        if (!mpDirectGuideWeights || mpDirectGuideWeights->getWidth() != mFrameDim.x || mpDirectGuideWeights->getHeight() != mFrameDim.y)
+            mpDirectGuideWeights = Texture::create2D(mFrameDim.x, mFrameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr, ResourceBindFlags::UnorderedAccess);
+    }
+    else mpDirectGuideWeights = nullptr;
+    var["gDirectGuideWeights"] = mpDirectGuideWeights;
     auto bind = [&](const ChannelDesc& channel)
     {
         Texture::SharedPtr pTex = renderData[channel.name]->asTexture();

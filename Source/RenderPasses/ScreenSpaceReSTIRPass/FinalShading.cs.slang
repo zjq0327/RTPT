@@ -10,9 +10,14 @@
 import LoadShadingData;
 import Rendering.Materials.StandardMaterial;
 import Rendering.Materials.Microfacet;
+import RenderPasses.Shared.Denoising.NRDConstants;
+import Utils.Color.ColorHelpers;
 import Experimental.ScreenSpaceReSTIR.ScreenSpaceReSTIR;
 
 RWTexture2D<float4> gColor;
+RWTexture2D<float4> gDirectDiffuseRadianceHitDist;
+RWTexture2D<float4> gDirectSpecularRadianceHitDist;
+RWTexture2D<float2> gDirectGuideWeights;
 RWTexture2D<float4> gEmission;
 RWTexture2D<float4> gDiffuseIllumination;
 RWTexture2D<float4> gDiffuseReflectance;
@@ -39,11 +44,25 @@ struct FinalShading
     uint numReSTIRInstances;
     uint ReSTIRInstanceID;
 
+    float4 accumulateDirectRadiance(float4 previous, float3 radiance, float distance, inout float guideWeight)
+    {
+        float weight = luminance(radiance);
+        if (weight > guideWeight)
+        {
+            previous.a = min(distance, kNRDInvalidPathLength);
+            guideWeight = weight;
+        }
+        previous.rgb += radiance / numReSTIRInstances;
+        return previous;
+    }
+
     void execute(uint2 pixel)
     {
         if (any(pixel >= frameDim)) return;
 
         float3 color = {};
+        float3 diffuse = {};
+        float3 specular = {};
         float3 emission = {};
         float3 diffuseReflectance = {};
         float3 diffuseIllumination = {};
@@ -62,8 +81,6 @@ struct FinalShading
             bool valid = screenSpaceReSTIR.getFinalSample(pixel, dir, distance, Li);
 
             // Evaluate diffuse and specular lobes.
-            float3 diffuse = {};
-            float3 specular = {};
             if (valid)
             {
                 sd.setActiveLobes((uint)LobeType::DiffuseReflection);
@@ -100,6 +117,20 @@ struct FinalShading
         }
 
         // Write active outputs.
+
+        bool writeDirectGuides = numReSTIRInstances > 1 && (is_valid(gDirectDiffuseRadianceHitDist) || is_valid(gDirectSpecularRadianceHitDist));
+        float2 guideWeights = writeDirectGuides && ReSTIRInstanceID > 0 ? gDirectGuideWeights[pixel] : 0.f;
+        if (is_valid(gDirectDiffuseRadianceHitDist))
+        {
+            float4 previous = ReSTIRInstanceID == 0 ? float4(0.f) : gDirectDiffuseRadianceHitDist[pixel];
+            gDirectDiffuseRadianceHitDist[pixel] = accumulateDirectRadiance(previous, diffuse, hitT, guideWeights.x);
+        }
+        if (is_valid(gDirectSpecularRadianceHitDist))
+        {
+            float4 previous = ReSTIRInstanceID == 0 ? float4(0.f) : gDirectSpecularRadianceHitDist[pixel];
+            gDirectSpecularRadianceHitDist[pixel] = accumulateDirectRadiance(previous, specular, hitT, guideWeights.y);
+        }
+        if (writeDirectGuides) gDirectGuideWeights[pixel] = guideWeights;
 
         if (ReSTIRInstanceID == 0)
         {
