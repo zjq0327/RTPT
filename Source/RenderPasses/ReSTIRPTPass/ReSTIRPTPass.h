@@ -16,6 +16,7 @@
 #include "Rendering/Materials/TexLODTypes.slang"
 #include "Params.slang"
 #include <fstream>
+#include <tuple>
 
 using namespace Falcor;
 
@@ -40,6 +41,7 @@ public:
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
     const PixelStats::SharedPtr& getPixelStats() const { return mpPixelStats; }
+    std::vector<uint32_t> getSharcStats() const;
 
     void updateDict(const Dictionary& dict) override;
     void initDict() override;
@@ -54,6 +56,9 @@ private:
     void prepareResources(RenderContext* pRenderContext, const RenderData& renderData);
     void setNRDData(const ShaderVar& var, const RenderData& renderData) const;
     void preparePathTracer(const RenderData& renderData);
+    void bindSharc(const ShaderVar& var) const;
+    void trackSharcMotion(bool lightingChanged);
+    void updateSharc(RenderContext* pRenderContext);
     void resetLighting();
     void prepareMaterials(RenderContext* pRenderContext);
     bool prepareLighting(RenderContext* pRenderContext);
@@ -86,6 +91,10 @@ private:
         bool        useNEE = true;                              ///< Use next-event estimation (NEE). This enables shadow ray(s) from each path vertex.
         bool        useMIS = true;                              ///< Use multiple importance sampling (MIS) when NEE is enabled.
         bool        useRussianRoulette = false;                 ///< Use russian roulette to terminate low throughput paths.
+        bool        enableSHARC = false;
+        bool        sharcUseCache = true;
+        uint32_t    sharcMinDepth = 2;
+        bool        sharcStats = false;
         bool        useAlphaTest = true;                        ///< Use alpha testing on non-opaque triangles.
         uint32_t    maxNestedMaterials = 2;                     ///< Maximum supported number of nested materials.
         bool        useLightsInDielectricVolumes = false;       ///< Use lights inside of volumes (transmissive materials). We typically don't want this because lights are occluded by the interface.
@@ -138,11 +147,23 @@ private:
         mUseDirectLighting = true;
         mTemporalHistoryLength = 20;
         mNoResamplingForTemporalReuse = false;
+        mSharcFreeze = false;
     }
 
     // Configuration
     RestirPathTracerParams          mParams;                    ///< Runtime path tracer parameters.
     StaticParams                    mStaticParams;              ///< Static parameters. These are set as compile-time constants in the shaders.
+    auto getSharcTrainingSettings() const
+    {
+        const auto& p = mStaticParams;
+        return std::make_tuple(p.sharcMinDepth, p.maxSurfaceBounces, p.maxDiffuseBounces, p.maxSpecularBounces,
+            p.maxTransmissionBounces, p.useNEE, p.useMIS, p.misHeuristic, p.misPowerExponent, p.disableCaustics,
+            p.useBSDFSampling, p.useDeterministicBSDF, p.separatePathBSDF, p.useRussianRoulette,
+            p.adjustShadingNormals, p.useAlphaTest, p.maxNestedMaterials, p.useLightsInDielectricVolumes,
+            p.limitTransmission, p.maxTransmissionReflectionDepth, p.maxTransmissionRefractionDepth,
+            p.disableDirectIllumination, p.primaryLodMode, p.emissiveSampler, p.pathSamplingMode,
+            mParams.lodBias, mParams.specularRoughnessThreshold);
+    }
     LightBVHSampler::Options        mLightBVHOptions;           ///< Current options for the light BVH sampler.
 
     // Internal state
@@ -153,6 +174,18 @@ private:
     PixelStats::SharedPtr           mpPixelStats;               ///< Utility class for collecting pixel stats.
     PixelDebug::SharedPtr           mpPixelDebug;               ///< Utility class for pixel debugging (print in shaders).
     ParameterBlock::SharedPtr       mpPathTracerBlock;          ///< Parameter block for the path tracer.
+    ComputePass::SharedPtr          mpSharcUpdate;
+    ComputePass::SharedPtr          mpSharcResolve;
+    ComputePass::SharedPtr          mpSharcInvalidate;
+    Buffer::SharedPtr               mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved;
+    Buffer::SharedPtr               mpSharcStats;
+    Buffer::SharedPtr               mpSharcMotionBounds;
+    std::vector<AABB>               mSharcPreviousBounds;
+    std::vector<float4>             mSharcMotionBounds;
+    bool                            mSharcFreeze = false;
+    bool                            mSharcNeedsClear = true;
+    uint32_t                        mSharcFrameIndex = 0;
+    float3                          mSharcPreviousCamera = float3(0.f);
 
     // internal below
     bool                            mRecompile = false;         ///< Set to true when program specialization has changed.

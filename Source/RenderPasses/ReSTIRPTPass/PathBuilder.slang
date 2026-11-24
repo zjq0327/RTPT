@@ -31,6 +31,62 @@ struct PathBuilder
     ReSTIRPathFlags pathFlags;
     float3 cachedJacobian = 1.f;
 
+#if SHARC_ENABLE && !BPR
+    // The outer candidate represents one seed after the RC bounce. Choose one
+    // explicit/cache endpoint within it and carry its inner RIS normalization.
+    float suffixWeightSum = 0.f;
+    float suffixRootSurvivalPdf = 1.f;
+    float suffixBestRank;
+    float suffixSelectedLuminance;
+    float3 suffixSelectedF;
+    float3 suffixSelectedPostfix;
+    float suffixSelectedLightPdf;
+    ReSTIRPathFlags suffixSelectedFlags;
+
+    [mutating] void offerSuffixEvent(uint depth, float3 F, float3 postfix, float survivalPdf,
+        bool nee, bool cache, float misWeight, float lightPdf, uint lightType)
+    {
+        // Select in the suffix domain. Camera throughput must not change the
+        // winner for the same suffix replayed from another pixel.
+        float luma = PathReservoir::toScalar(postfix);
+        float weight = luma * suffixRootSurvivalPdf / survivalPdf;
+        if (!(weight > 0.f) || !isfinite(weight)) return;
+        uint event = depth * 3u + (cache ? 2u : nee ? 1u : 0u);
+        uint bits = jenkinsHash(cachedRandomSeed ^ jenkinsHash(event + 1u));
+        float u = (float(bits >> 9u) + 0.5f) * (1.f / 8388608.f);
+        float rank = -log(u) / weight;
+        bool selected = suffixWeightSum == 0.f || rank < suffixBestRank;
+        suffixWeightSum += weight;
+        if (!selected) return;
+        suffixBestRank = rank;
+        suffixSelectedLuminance = luma;
+        suffixSelectedF = F;
+        suffixSelectedPostfix = depth == rcVertexLength ? postfix / misWeight : postfix;
+        suffixSelectedLightPdf = lightPdf;
+        suffixSelectedFlags = pathFlags;
+        suffixSelectedFlags.insertPathLength(depth);
+        suffixSelectedFlags.insertRcVertexLength(rcVertexLength);
+        suffixSelectedFlags.insertLastVertexNEE(nee);
+        suffixSelectedFlags.insertLightType(lightType);
+        suffixSelectedFlags.setSuffixEvent(true, cache);
+    }
+
+    [mutating] void finalizeSuffix(inout PathReservoir reservoir)
+    {
+        if (!(suffixWeightSum > 0.f)) return;
+        float innerWeight = suffixWeightSum / suffixSelectedLuminance;
+        if (!reservoir.add(suffixSelectedF * innerWeight, suffixRootSurvivalPdf, sg)) return;
+        reservoir.pathFlags = suffixSelectedFlags;
+        reservoir.rcVertexIrradiance[0] = suffixSelectedPostfix * innerWeight;
+        reservoir.rcVertexWi[0] = rcVertexWi[0];
+        reservoir.rcVertexHit = rcVertexHit;
+        reservoir.cachedJacobian = cachedJacobian;
+        reservoir.rcRandomSeed = cachedRandomSeed;
+        reservoir.lightPdf = suffixSelectedLightPdf;
+    }
+
+#endif
+
     [mutating]
     void init<S : ISampleGenerator>(inout S sg)
     {
@@ -42,8 +98,11 @@ struct PathBuilder
 #endif
     }
 
-    void finalize(inout PathReservoir pathReservoir)
+    [mutating] void finalize(inout PathReservoir pathReservoir)
     {
+#if SHARC_ENABLE && !BPR
+        finalizeSuffix(pathReservoir);
+#endif
 #if BPR
         pathReservoir.weight = PathReservoir::toScalar(pathReservoir.F);
 
@@ -84,6 +143,15 @@ struct PathBuilder
             pathReservoir.pathFlags.insertPathLength(pathLength); // excluding the NEE vertex
             pathReservoir.pathFlags.insertRcVertexLength(rcVertexLength);
 #else
+            // An escape at pathLength == RC is reached by the outgoing RC ray.
+#if SHARC_ENABLE
+            bool grouped = useHybridShift && !forceAdd && rcVertexLength < kMaximumPathLength && pathLength >= rcVertexLength;
+            if (grouped)
+            {
+                offerSuffixEvent(pathLength, pathWeight, postfixWeight, russianroulettePDF, false, false, misWeight, lightPdf, lightType);
+                return false;
+            }
+#endif
             if (forceAdd || pathReservoir.add(pathWeight, russianroulettePDF, sg))
             {
                 selected = true;
@@ -91,6 +159,9 @@ struct PathBuilder
                 pathReservoir.pathFlags.insertPathLength(pathLength);
                 pathReservoir.pathFlags.insertRcVertexLength(rcVertexLength);
                 pathReservoir.pathFlags.insertLastVertexNEE(false);
+#if SHARC_ENABLE
+                pathReservoir.pathFlags.setSuffixEvent(grouped, false);
+#endif
                 pathReservoir.rcVertexIrradiance[0] = postfixWeight;
                 pathReservoir.F = pathWeight;
                 pathReservoir.rcVertexWi[0] = rcVertexWi[0];
@@ -149,6 +220,14 @@ struct PathBuilder
 
             selected = true;
 #else
+#if SHARC_ENABLE
+            bool grouped = useHybridShift && !forceAdd && rcVertexLength < kMaximumPathLength && pathLength > rcVertexLength;
+            if (grouped)
+            {
+                offerSuffixEvent(pathLength, pathWeight, postfixWeight, russianroulettePDF, true, false, misWeight, lightPdf, lightType);
+                return false;
+            }
+#endif
             if (forceAdd || pathReservoir.add(pathWeight, russianroulettePDF, sg))
             {
                 selected = true;
@@ -156,6 +235,9 @@ struct PathBuilder
                 pathReservoir.pathFlags.insertPathLength(pathLength); // excluding the NEE vertex
                 pathReservoir.pathFlags.insertRcVertexLength(rcVertexLength);
                 pathReservoir.pathFlags.insertLastVertexNEE(true);
+#if SHARC_ENABLE
+                pathReservoir.pathFlags.setSuffixEvent(grouped, false);
+#endif
                 pathReservoir.rcVertexIrradiance[0] = postfixWeight;
                 pathReservoir.F = pathWeight;
                 pathReservoir.rcVertexWi[0] = rcVertexWi[0];

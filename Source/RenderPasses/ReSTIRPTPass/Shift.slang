@@ -181,11 +181,20 @@ float3 computeShiftedIntegrandHybrid(const RestirPathTracerParams params, bool u
             {
                 static const int id = 0;
                 gPathTracer.traceTemporalUpdate(dstRcPrevVertexSd, tempPathReservoir);
+#if SHARC_ENABLE && !BPR
+                srcReservoir.pathFlags = tempPathReservoir.pathFlags;
+#endif
                 srcReservoir.rcVertexIrradiance[id] = tempPathReservoir.rcVertexIrradiance[id];
                 srcReservoir.lightPdf = tempPathReservoir.lightPdf;
                 srcReservoir.pathFlags.insertLightType(tempPathReservoir.pathFlags.lightType());
                 srcReservoir.rcVertexWi[id] = tempPathReservoir.rcVertexWi[id];
             }
+#if SHARC_ENABLE && SHARC_STATS && !BPR
+            else if (srcReservoir.pathFlags.isSuffixGroup())
+            {
+                InterlockedAdd(gPathTracer.sharc.stats[11], 1u);
+            }
+#endif
 
             rcTp = computeShiftedIntegrandReconnection(params, reconnectionJacobian, dstRcPrevVertexSd, srcRcPrevVertexSd, srcReservoir,
                 evalVisibility, true, srcReservoir.pathFlags.rcVertexLength() > 1);

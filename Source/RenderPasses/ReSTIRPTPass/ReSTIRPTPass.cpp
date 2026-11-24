@@ -17,6 +17,12 @@ namespace
     const std::string kSpatialPathRetraceFile = "RenderPasses/ReSTIRPTPass/SpatialPathRetrace.cs.slang";
     const std::string kTemporalPathRetraceFile = "RenderPasses/ReSTIRPTPass/TemporalPathRetrace.cs.slang";
     const std::string kComputePathReuseMISWeightsFile = "RenderPasses/ReSTIRPTPass/ComputePathReuseMISWeights.cs.slang";
+    const std::string kSharcUpdateFile = "RenderPasses/ReSTIRPTPass/SharcUpdate.cs.slang";
+    const std::string kSharcResolveFile = "RenderPasses/ReSTIRPTPass/SharcResolve.cs.slang";
+    const std::string kSharcInvalidateFile = "RenderPasses/ReSTIRPTPass/SharcInvalidate.cs.slang";
+    const uint32_t kSharcCapacity = 1u << 20;
+    const uint32_t kSharcUpdateStride = 5u;
+    const uint32_t kSharcCounterCount = 12u;
 
     // Render pass inputs and outputs.
     const std::string kInputVBuffer = "vbuffer";
@@ -198,6 +204,11 @@ namespace
     const std::string kCandidateSamples = "candidateSamples";
     const std::string kTemporalUpdateForDynamicScene = "temporalUpdateForDynamicScene";
     const std::string kEnableRayStats = "enableRayStats";
+    const std::string kEnableSHARC = "enableSHARC";
+    const std::string kSharcUseCache = "sharcUseCache";
+    const std::string kSharcMinDepth = "sharcMinDepth";
+    const std::string kSharcFreeze = "sharcFreeze";
+    const std::string kSharcStats = "sharcStats";
 
     const uint32_t kNeighborOffsetCount = 8192;
 }
@@ -217,11 +228,17 @@ extern "C" __declspec(dllexport) void getPasses(Falcor::RenderPassLibrary & lib)
 
 void ReSTIRPTPass::updateDict(const Dictionary& dict)
 {
-    // cleanToDefaultValue
+    if (dict.size() == 1 && dict.keyExists(kSharcFreeze))
+    {
+        mSharcFreeze = dict[kSharcFreeze];
+        return;
+    }
+    const auto oldTrainingSettings = getSharcTrainingSettings();
     bool needToReset = parseDictionary(dict);
     if (needToReset)
     {
         validateOptions();
+        mSharcNeedsClear |= oldTrainingSettings != getSharcTrainingSettings();
         mOptionsChanged = true;
         mRecompile = true;
         mParams.frameCount = 0;
@@ -233,7 +250,9 @@ void ReSTIRPTPass::updateDict(const Dictionary& dict)
 
 void ReSTIRPTPass::initDict()
 {
+    const auto oldTrainingSettings = getSharcTrainingSettings();
     Init();
+    mSharcNeedsClear |= oldTrainingSettings != getSharcTrainingSettings();
     mOptionsChanged = true;
     mRecompile = true;
     mParams.frameCount = 0;
@@ -273,6 +292,11 @@ void ReSTIRPTPass::registerBindings(pybind11::module& m)
 
     pybind11::class_<ReSTIRPTPass, RenderPass, ReSTIRPTPass::SharedPtr> pass(m, "ReSTIRPTPass");
     pass.def_property_readonly("pixelStats", &ReSTIRPTPass::getPixelStats);
+    pass.def("getSharcStats", &ReSTIRPTPass::getSharcStats);
+    pass.def_property_readonly("reservoirStride", [](const ReSTIRPTPass& pt)
+    {
+        return pt.mpOutputReservoirs ? pt.mpOutputReservoirs->getElementSize() : 0u;
+    });
 
     pass.def_property("useFixedSeed",
         [](const ReSTIRPTPass* pt) { return pt->mParams.useFixedSeed ? true : false; },
@@ -440,6 +464,11 @@ bool ReSTIRPTPass::parseDictionary(const Dictionary& dict)
         else if (key == kCandidateSamples) mStaticParams.candidateSamples = value;
         else if (key == kTemporalUpdateForDynamicScene) mStaticParams.temporalUpdateForDynamicScene = value;
         else if (key == kEnableRayStats) mEnableRayStats = value;
+        else if (key == kEnableSHARC) mStaticParams.enableSHARC = value;
+        else if (key == kSharcUseCache) mStaticParams.sharcUseCache = value;
+        else if (key == kSharcMinDepth) mStaticParams.sharcMinDepth = value;
+        else if (key == kSharcFreeze) mSharcFreeze = value;
+        else if (key == kSharcStats) mStaticParams.sharcStats = value;
         else logWarning("Unknown field '" + key + "' in ReSTIRPTPass dictionary");
     }
 
@@ -482,6 +511,7 @@ bool ReSTIRPTPass::parseDictionary(const Dictionary& dict)
 
 void ReSTIRPTPass::validateOptions()
 {
+    mStaticParams.sharcMinDepth = std::clamp(mStaticParams.sharcMinDepth, 2u, kMaxBounces);
     if (mParams.specularRoughnessThreshold < 0.f || mParams.specularRoughnessThreshold > 1.f)
     {
         logError("'specularRoughnessThreshold' has invalid value. Clamping to range [0,1].");
@@ -594,6 +624,11 @@ Dictionary ReSTIRPTPass::getScriptingDictionary()
     d[kCandidateSamples] = mStaticParams.candidateSamples;
     d[kTemporalUpdateForDynamicScene] = mStaticParams.temporalUpdateForDynamicScene;
     d[kEnableRayStats] = mEnableRayStats;
+    d[kEnableSHARC] = mStaticParams.enableSHARC;
+    d[kSharcUseCache] = mStaticParams.sharcUseCache;
+    d[kSharcMinDepth] = mStaticParams.sharcMinDepth;
+    d[kSharcFreeze] = mSharcFreeze;
+    d[kSharcStats] = mStaticParams.sharcStats;
     // Denoising parameters
     d[kUseNRDDemodulation] = mStaticParams.useNRDDemodulation;
 
@@ -639,6 +674,10 @@ void ReSTIRPTPass::setScene(RenderContext* pRenderContext, const Scene::SharedPt
 {
     mpScene = pScene;
     mParams.frameCount = 0;
+    mSharcNeedsClear = true;
+    mSharcFrameIndex = 0;
+    mSharcPreviousBounds.clear();
+    mpSharcUpdate = nullptr;
 
     resetLighting();
 
@@ -707,6 +746,7 @@ void ReSTIRPTPass::execute(RenderContext* pRenderContext, const RenderData& rend
             // Prepare the path tracer parameter block.
             // This should be called after all resources have been created.
             preparePathTracer(renderData);
+            if (restir_i == 0 && mStaticParams.enableSHARC) updateSharc(pRenderContext);
 
             // Reset atomic counters.
 
@@ -784,6 +824,7 @@ void ReSTIRPTPass::execute(RenderContext* pRenderContext, const RenderData& rend
 
 void ReSTIRPTPass::renderUI(Gui::Widgets& widget)
 {
+    const auto oldTrainingSettings = getSharcTrainingSettings();
     bool dirty = false;
 
     // Rendering options.
@@ -797,6 +838,7 @@ void ReSTIRPTPass::renderUI(Gui::Widgets& widget)
     if (dirty)
     {
         validateOptions();
+        mSharcNeedsClear |= oldTrainingSettings != getSharcTrainingSettings();
         mOptionsChanged = true;
     }
 }
@@ -844,6 +886,16 @@ bool ReSTIRPTPass::renderRenderingUI(Gui::Widgets& widget)
     }
 
     dirty |= widget.checkbox("Direct lighting (ReSTIR DI)", mUseDirectLighting);
+    if (auto group = widget.group("SHaRC radiance cache"))
+    {
+        dirty |= group.checkbox("Enable SHaRC", mStaticParams.enableSHARC);
+        if (mStaticParams.enableSHARC)
+        {
+            dirty |= group.checkbox("Use cache for path termination", mStaticParams.sharcUseCache);
+            dirty |= group.var("First query depth (2 = x3)", mStaticParams.sharcMinDepth, 2u, kMaxBounces);
+            group.checkbox("Freeze cache updates", mSharcFreeze);
+        }
+    }
 
     bool pathSamplingModeChanged = widget.dropdown("Path Sampling Mode", kPathSamplingModeList, reinterpret_cast<uint32_t&>(mStaticParams.pathSamplingMode));
     if (pathSamplingModeChanged)
@@ -1159,6 +1211,43 @@ void ReSTIRPTPass::updatePrograms()
     auto defines = mStaticParams.getDefines(*this);
 
     // Update program specialization. This is done through defines in lieu of specialization constants.
+    if (mStaticParams.enableSHARC)
+    {
+        auto updateDefines = defines;
+        updateDefines.add("SHARC_TRAINING", "1");
+        updateDefines.add(mpScene->getSceneDefines());
+        if (mpEmissiveSampler) updateDefines.add(mpEmissiveSampler->getDefines());
+        if (!mpSharcUpdate)
+        {
+            Program::Desc updateDesc;
+            updateDesc.addShaderLibrary(kSharcUpdateFile).csEntry("main").setShaderModel("6_5");
+            mpSharcUpdate = ComputePass::create(updateDesc, updateDefines, true);
+        }
+        else
+        {
+            mpSharcUpdate->getProgram()->setDefines(updateDefines);
+            mpSharcUpdate->setVars(nullptr);
+        }
+        if (!mpSharcResolve)
+        {
+            Program::Desc resolveDesc;
+            resolveDesc.addShaderLibrary(kSharcResolveFile).csEntry("main").setShaderModel("6_5");
+            mpSharcResolve = ComputePass::create(resolveDesc, {}, true);
+        }
+    }
+    else
+    {
+        mpSharcUpdate = nullptr;
+        mpSharcResolve = nullptr;
+        mpSharcInvalidate = nullptr;
+        mpSharcMotionBounds = nullptr;
+        mSharcPreviousBounds.clear();
+        mSharcMotionBounds.clear();
+        mpSharcKeys = mpSharcLocks = mpSharcAccumulation = mpSharcResolved = nullptr;
+        mpSharcStats = nullptr;
+        mSharcNeedsClear = true;
+        mSharcFrameIndex = 0;
+    }
     mpGeneratePaths->getProgram()->addDefines(defines);
     mpTracePass->getProgram()->addDefines(defines);
     mpReflectTypes->getProgram()->addDefines(defines);
@@ -1185,6 +1274,22 @@ void ReSTIRPTPass::updatePrograms()
 
 void ReSTIRPTPass::prepareResources(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    if (mStaticParams.enableSHARC && !mpSharcKeys)
+    {
+        const auto flags = Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess;
+        mpSharcKeys = Buffer::createStructured(8u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
+        mpSharcLocks = Buffer::createStructured(4u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
+        mpSharcAccumulation = Buffer::createStructured(16u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
+        mpSharcResolved = Buffer::createStructured(16u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
+        mSharcNeedsClear = true;
+    }
+    if (mStaticParams.enableSHARC && mStaticParams.sharcStats)
+    {
+        if (!mpSharcStats)
+            mpSharcStats = Buffer::createStructured(sizeof(uint32_t), kSharcCounterCount,
+                Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
+    }
+    else mpSharcStats = nullptr;
     // Compute allocation requirements for paths and output samples.
     // Note that the sample buffers are padded to whole tiles, while the max path count depends on actual frame dimension.
     // If we don't have a fixed sample count, assume the worst case.
@@ -1289,6 +1394,7 @@ void ReSTIRPTPass::preparePathTracer(const RenderData& renderData)
     setShaderData(var, renderData, true, false);
     var["outputReservoirs"] = mpOutputReservoirs;
     var["directLighting"] = renderData[kInputDirectLighting]->asTexture();
+    if (mStaticParams.enableSHARC && mStaticParams.sharcUseCache) bindSharc(var["sharc"]);
 }
 
 void ReSTIRPTPass::resetLighting()
@@ -1301,6 +1407,165 @@ void ReSTIRPTPass::resetLighting()
     mpEmissiveSampler = nullptr;
     mpEnvMapSampler = nullptr;
     mRecompile = true;
+}
+
+void ReSTIRPTPass::bindSharc(const ShaderVar& var) const
+{
+    auto cache = var["cache"];
+    auto grid = cache["hashGridParameters"];
+    grid["cameraPosition"] = mpScene->getCamera()->getPosition();
+    grid["logarithmBase"] = 2.f;
+    grid["sceneScale"] = 16.f;
+    grid["levelBias"] = 0.f;
+    auto table = cache["hashGridData"];
+    table["capacity"] = kSharcCapacity;
+    table["hashEntriesBuffer"] = mpSharcKeys;
+    table["lockBuffer"] = mpSharcLocks;
+    cache["accumulationBuffer"] = mpSharcAccumulation;
+    cache["resolvedBuffer"] = mpSharcResolved;
+    cache["radianceScale"] = 1000.f;
+    var["minRoughness"] = 0.4f;
+    if (mpSharcStats)
+    {
+        auto stats = var.findMember("stats");
+        if (stats.isValid()) stats = mpSharcStats;
+    }
+}
+
+void ReSTIRPTPass::updateSharc(RenderContext* pRenderContext)
+{
+    const auto buffers = {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved};
+    if (mSharcNeedsClear)
+    {
+        for (const auto& buffer : buffers)
+        {
+            pRenderContext->clearUAV(buffer->getUAV().get(), uint4(0));
+            pRenderContext->uavBarrier(buffer.get());
+        }
+        mSharcPreviousCamera = mpScene->getCamera()->getPosition();
+        mSharcNeedsClear = false;
+    }
+    else if (!mSharcMotionBounds.empty())
+    {
+        PROFILE("SHaRC Invalidate");
+        if (!mpSharcInvalidate)
+        {
+            Program::Desc desc;
+            desc.addShaderLibrary(kSharcInvalidateFile).csEntry("main").setShaderModel("6_5");
+            mpSharcInvalidate = ComputePass::create(desc, {}, true);
+        }
+        const auto count = uint32_t(mSharcMotionBounds.size());
+        if (!mpSharcMotionBounds || mpSharcMotionBounds->getElementCount() < count)
+            mpSharcMotionBounds = Buffer::createStructured(sizeof(float4), count, Resource::BindFlags::ShaderResource,
+                Buffer::CpuAccess::None, nullptr, false);
+        mpSharcMotionBounds->setBlob(mSharcMotionBounds.data(), 0, count * sizeof(float4));
+        auto var = mpSharcInvalidate->getRootVar();
+        var["gBounds"] = mpSharcMotionBounds;
+        var["PerFrame"]["gBoundsCount"] = count / 2u;
+        bindSharc(var["PerFrame"]["gSharc"]);
+        mpSharcInvalidate->execute(pRenderContext, uint3(kSharcCapacity, 1u, 1u));
+        pRenderContext->uavBarrier(mpSharcAccumulation.get());
+        pRenderContext->uavBarrier(mpSharcResolved.get());
+    }
+    if (mpSharcStats)
+    {
+        pRenderContext->clearUAV(mpSharcStats->getUAV().get(), uint4(0));
+        pRenderContext->uavBarrier(mpSharcStats.get());
+    }
+    if (mSharcFreeze) return;
+    {
+        PROFILE("SHaRC SparseUpdate");
+        auto var = mpSharcUpdate->getRootVar();
+        mpScene->setRaytracingShaderData(pRenderContext, var);
+        mpSampleGenerator->setShaderData(var);
+        var["gPathTracer"] = mpPathTracerBlock;
+        auto cb = var["CB"];
+        bindSharc(cb["gSharcWrite"]);
+        cb["gSharcFrameIndex"] = mSharcFrameIndex;
+        cb["gUpdateStride"] = kSharcUpdateStride;
+        mpSharcUpdate->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(kSharcUpdateStride)), 1u));
+        for (const auto& buffer : buffers) pRenderContext->uavBarrier(buffer.get());
+    }
+    {
+        PROFILE("SHaRC Resolve");
+        auto cb = mpSharcResolve->getRootVar()["PerFrame"];
+        bindSharc(cb["gSharc"]);
+        auto resolve = cb["gResolve"];
+        resolve["cameraPositionPrev"] = mSharcPreviousCamera;
+        resolve["accumulationFrameNum"] = 32u;
+        resolve["responsiveFrameNum"] = 1u;
+        resolve["staleFrameNumMax"] = 128u;
+        resolve["frameIndex"] = mSharcFrameIndex;
+        mpSharcResolve->execute(pRenderContext, uint3(kSharcCapacity, 1u, 1u));
+        for (const auto& buffer : buffers) pRenderContext->uavBarrier(buffer.get());
+    }
+    mSharcPreviousCamera = mpScene->getCamera()->getPosition();
+    ++mSharcFrameIndex;
+}
+
+std::vector<uint32_t> ReSTIRPTPass::getSharcStats() const
+{
+    std::vector<uint32_t> result(kSharcCounterCount, 0u);
+    if (mpSharcStats)
+    {
+        const auto* data = static_cast<const uint32_t*>(mpSharcStats->map(Buffer::MapType::Read));
+        std::copy_n(data, kSharcCounterCount, result.begin());
+        mpSharcStats->unmap();
+    }
+    return result;
+}
+
+void ReSTIRPTPass::trackSharcMotion(bool lightingChanged)
+{
+    using Updates = Scene::UpdateFlags;
+    const auto updates = mpScene->getUpdates();
+    const auto globalChanges = Updates::GeometryChanged | Updates::DisplacementChanged | Updates::MaterialsChanged |
+        Updates::LightsMoved | Updates::LightIntensityChanged | Updates::LightPropertiesChanged | Updates::LightCountChanged |
+        Updates::LightCollectionChanged | Updates::EnvMapChanged | Updates::EnvMapPropertiesChanged | Updates::RenderSettingsChanged |
+        Updates::CustomPrimitivesMoved;
+    const bool graphChanged = is_set(updates, Updates::SceneGraphChanged);
+    const bool geometryMoved = graphChanged || is_set(updates, Updates::MeshesMoved) || is_set(updates, Updates::CurvesMoved);
+    const auto* animation = mpScene->getAnimationController();
+    // Vertex-deformed bounds live on the GPU in this Falcor version.
+    const bool deformed = (graphChanged && animation->getPrevVertexData()) ||
+        (is_set(updates, Updates::CurvesMoved) && animation->hasAnimatedCurveCaches());
+    mSharcNeedsClear |= lightingChanged || (updates & globalChanges) != Updates::None || deformed;
+    mSharcMotionBounds.clear();
+
+    const uint32_t meshes = mpScene->getMeshInstanceCount();
+    const uint32_t curves = mpScene->getCurveInstanceCount();
+    const bool first = mSharcPreviousBounds.size() != meshes + curves;
+    if (!first && !geometryMoved) return;
+    mSharcPreviousBounds.resize(meshes + curves);
+    mSharcNeedsClear |= first;
+    const auto& transforms = animation->getGlobalMatrices();
+    auto track = [&](uint32_t index, uint32_t node, const AABB& local)
+    {
+        if (!first && !animation->isMatrixChanged(node)) return;
+        const AABB world = local.transform(transforms[node]);
+        if (!mSharcNeedsClear)
+        {
+            AABB swept = world;
+            swept.include(mSharcPreviousBounds[index]);
+            if (swept.valid())
+            {
+                mSharcMotionBounds.emplace_back(swept.minPoint, 0.f);
+                mSharcMotionBounds.emplace_back(swept.maxPoint, 0.f);
+            }
+            else mSharcNeedsClear = true;
+        }
+        mSharcPreviousBounds[index] = world;
+    };
+    for (uint32_t i = 0; i < meshes; ++i)
+    {
+        const auto& instance = mpScene->getMeshInstance(i);
+        track(i, instance.globalMatrixID, mpScene->getMeshBounds(instance.meshID));
+    }
+    for (uint32_t i = 0; i < curves; ++i)
+    {
+        const auto& instance = mpScene->getCurveInstance(i);
+        track(meshes + i, instance.globalMatrixID, mpScene->getCurveBounds(instance.curveID));
+    }
 }
 
 void ReSTIRPTPass::prepareMaterials(RenderContext* pRenderContext)
@@ -1486,6 +1751,7 @@ bool ReSTIRPTPass::beginFrame(RenderContext* pRenderContext, const RenderData& r
 
     // Update the env map and emissive sampler to the current frame.
     bool lightingChanged = prepareLighting(pRenderContext);
+    if (mStaticParams.enableSHARC) trackSharcMotion(lightingChanged);
 
     // Update refresh flag if changes that affect the output have occured.
     auto& dict = renderData.getDictionary();
@@ -1506,6 +1772,7 @@ bool ReSTIRPTPass::beginFrame(RenderContext* pRenderContext, const RenderData& r
     if (gbufferAdjustShadingNormals != mGBufferAdjustShadingNormals)
     {
         mGBufferAdjustShadingNormals = gbufferAdjustShadingNormals;
+        mSharcNeedsClear = true;
         mRecompile = true;
     }
 
@@ -1813,6 +2080,9 @@ Program::DefineList ReSTIRPTPass::StaticParams::getDefines(const ReSTIRPTPass& o
     defines.add("USE_NEE", useNEE ? "1" : "0");
     defines.add("USE_MIS", useMIS ? "1" : "0");
     defines.add("USE_RUSSIAN_ROULETTE", useRussianRoulette ? "1" : "0");
+    defines.add("SHARC_ENABLE", enableSHARC && sharcUseCache ? "1" : "0");
+    defines.add("SHARC_MIN_DEPTH", std::to_string(sharcMinDepth));
+    defines.add("SHARC_STATS", enableSHARC && sharcUseCache && sharcStats ? "1" : "0");
     defines.add("USE_ALPHA_TEST", useAlphaTest ? "1" : "0");
     defines.add("USE_LIGHTS_IN_DIELECTRIC_VOLUMES", useLightsInDielectricVolumes ? "1" : "0");
     defines.add("LIMIT_TRANSMISSION", limitTransmission ? "1" : "0");

@@ -89,6 +89,13 @@ struct PathState
     float      russianRoulettePdf = 1.f;
     float3      sharedScatterDir;
     float      prevScatterPdf = 1.f;
+#if SHARC_ENABLE || SHARC_TRAINING
+    float previousRoughness;
+    bool previousDiffuse;
+#endif
+#if SHARC_ENABLE
+    bool replaySuffixGroup;
+#endif
 
     HitInfo rcPrevVertexHit;   // daqi: save the previous vertex of rcVertex, used in hybrid shift replay, for later reconnection
     float3 rcPrevVertexWo; // daqi: save the outgoing direction at the previous vertex of rcVertex, used in hybrid shift replay, for later reconnection

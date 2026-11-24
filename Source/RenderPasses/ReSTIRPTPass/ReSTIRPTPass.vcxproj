@@ -51,6 +51,15 @@
     <ShaderSource Include="PathTracer.slang" />
     <ShaderSource Include="ReflectTypes.cs.slang" />
     <ShaderSource Include="Shift.slang" />
+    <ShaderSource Include="SharcCache.slang" />
+    <ShaderSource Include="SharcInvalidate.cs.slang" />
+    <ShaderSource Include="SharcResolve.cs.slang" />
+    <ShaderSource Include="SharcUpdate.cs.slang" />
+    <ShaderSource Include="ThirdParty\SHARC\HashGridCommon.h" />
+    <ShaderSource Include="ThirdParty\SHARC\HashGridTypes.h" />
+    <ShaderSource Include="ThirdParty\SHARC\SharcCommon.h" />
+    <ShaderSource Include="ThirdParty\SHARC\SharcTypes.h" />
+    <ShaderSource Include="ThirdParty\SHARC\License.md" />
     <ShaderSource Include="StaticParams.slang" />
     <ShaderSource Include="TracePass.cs.slang" />
   </ItemGroup>

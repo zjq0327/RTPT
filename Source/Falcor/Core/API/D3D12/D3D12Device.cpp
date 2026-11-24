@@ -361,7 +361,7 @@ namespace Falcor
         else
         {
             supported |= Device::SupportedFeatures::Raytracing;
-            if (features5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1) supported |= Device::SupportedFeatures::RaytracingTier1_1;
+            if (features5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1) supported |= Device::SupportedFeatures::RaytracingTier1_1;
         }
 
         return supported;

@@ -125,6 +125,30 @@ struct ReSTIRPathFlags
         return (flags >> 16) & 1;
     }
 
+#if SHARC_ENABLE
+    bool isSharcTerminal() { return (flags & (1 << 17)) != 0; }
+    bool isSuffixGroup() { return (flags & (1 << 20)) != 0; }
+
+    [mutating] void setSuffixEvent(bool grouped, bool cache)
+    {
+        flags &= ~((1 << 20) | (1 << 17));
+        flags |= (int(grouped) << 20) | (int(cache) << 17);
+    }
+
+    // Outgoing RC edge state needed when restarting an actual suffix trace.
+    [mutating] void setSuffixRoot(uint diffuseBounces, uint specularBounces, bool diffuseEdge)
+    {
+        flags &= ~((0xf << 12) | (0xf << 21) | (1 << 25));
+        flags |= int(diffuseBounces & 0xfu) << 12;
+        flags |= int(specularBounces & 0xfu) << 21;
+        flags |= int(diffuseEdge) << 25;
+    }
+
+    uint suffixDiffuseBounces() { return uint(flags >> 12) & 0xfu; }
+    uint suffixSpecularBounces() { return uint(flags >> 21) & 0xfu; }
+    bool suffixDiffuseEdge() { return (flags & (1 << 25)) != 0; }
+#endif
+
     [mutating]
     void insertLightType(uint lightType)
     {

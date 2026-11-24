@@ -28,6 +28,9 @@ import Utils.Debug.PixelDebug;
 import LoadShadingData;
 import PathBuilder;
 import PathReservoir;
+#if SHARC_ENABLE
+import SharcCache;
+#endif
 
 #include "Utils/Math/MathConstants.slangh"
 
@@ -42,6 +45,9 @@ uint getAllowedBSDFFlags(bool isSpecularBounce)
 
 struct PathTracer
 {
+#if SHARC_ENABLE
+    SharcQueryData sharc;
+#endif
     RestirPathTracerParams params;                  ///< Runtime parameters.
     EnvMapSampler envMapSampler;                    ///< Environment map sampler. Only valid when kUseEnvLight == true.
     EmissiveLightSampler emissiveSampler;           ///< Emissive light sampler. Only valid when kUseEmissiveLights == true.
@@ -352,6 +358,11 @@ struct PathTracer
 
             path.clearEventFlags();
 
+#if SHARC_ENABLE || SHARC_TRAINING
+            path.previousRoughness = sd.linearRoughness;
+            path.previousDiffuse = result.isLobe(LobeType::DiffuseReflection);
+#endif
+
             // Handle reflection events.
 
             if (result.isLobe(LobeType::Reflection))
@@ -497,6 +508,10 @@ struct PathTracer
 
             // daqi: if we use direction reuse, then base and offset path reflection/transmission type is allowed to be different
             bool isTransmissionEvent = dot(sd.N, result.wi) < 0;
+#if SHARC_ENABLE
+            path.previousRoughness = sd.linearRoughness;
+            path.previousDiffuse = !isSpecularBounce && !isTransmissionEvent;
+#endif
 
             // daqi: set delta/transmission path flags. we don't care about other path flags since our resampling doesn't depend on the sampled BSDF components
             // Handle transmission events.
@@ -957,6 +972,25 @@ struct PathTracer
         }
     }
 
+    ShadingData loadPathSurface(PathState path)
+    {
+        if (kPrimaryLodMode == TexLODMode::RayDiffs && path.length == 0 && path.hit.getType() == HitType::Triangle)
+        {
+            float2 ddx, ddy;
+            computeDerivativesAtPrimaryTriangleHit(path.hit.getTriangleHit(), path.getPixel(), params.frameDim, ddx, ddy);
+            return loadShadingDataFootprint(path.hit, -path.dir, true, ddx, ddy);
+        }
+        return loadShadingData(path.hit, -path.dir, path.length == 0, path.length > 0 ? params.lodBias : 0.f);
+    }
+
+#if SHARC_ENABLE || SHARC_TRAINING
+    bool allowsSharcDepth(PathState path)
+    {
+        return path.length >= SHARC_MIN_DEPTH && path.length < kMaximumPathLength &&
+            (path.length < 4 || path.previousDiffuse) && !path.isTransmission() && !hasFinishedSurfaceBounces(path);
+    }
+#endif
+
     /** Handle the case when a scatter ray hits the scene.
         After handling the hit, a new scatter ray is generated or the path is terminated.
         \param[in,out] path The path state.
@@ -976,26 +1010,39 @@ struct PathTracer
         bool isCurveHit = path.hit.getType() == HitType::Curve;
 
         // Load vertex/material attributes. This is a long latency operation.
-        ShadingData sd;
-
-        if (kPrimaryLodMode == TexLODMode::RayDiffs && path.length == 0 && path.hit.getType() == HitType::Triangle)
-        {
-            // Filtered lookups at primary hit
-            float2 ddx, ddy;
-            computeDerivativesAtPrimaryTriangleHit(path.hit.getTriangleHit(), path.getPixel(), params.frameDim, ddx, ddy);
-            sd = loadShadingDataFootprint(path.hit, -path.dir, true, ddx, ddy);
-        }
-        else
-        {
-            float lod = path.length > 0 ? params.lodBias : 0.f;
-            sd = loadShadingData(path.hit, -path.dir, path.length == 0, lod);
-        }
+        ShadingData sd = loadPathSurface(path);
 
         // Reject false hits in nested dielectrics.
 
         if (handleHomogeneousVolumeExtinction(path, sd)) return;
 
         if (!handleNestedDielectrics(sd, path)) return;
+
+#if SHARC_ENABLE && !BPR
+        // RC choice, prefix replay and connection visibility use explicit geometry.
+        // A tail query is only legal once its outgoing RC edge has been fixed.
+        bool rawPT = PathSamplingMode(kPathSamplingMode) == PathSamplingMode::PathTracing;
+        bool tracedTail = path.useHybridShift && !path.enableRandomReplay && path.length > path.pathBuilder.rcVertexLength;
+        if ((rawPT || tracedTail) && allowsSharcDepth(path))
+        {
+#if SHARC_STATS
+            InterlockedAdd(sharc.stats[path.replaySuffixGroup ? 4 : 2], 1u);
+#endif
+            float3 cachedRadiance;
+            if (sharc.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, cachedRadiance))
+            {
+#if SHARC_STATS
+                InterlockedAdd(sharc.stats[path.replaySuffixGroup ? 5 : 3], 1u);
+#endif
+                float3 contribution = path.getCurrentThp() * cachedRadiance;
+                if (rawPT) path.L += contribution;
+                else path.pathBuilder.offerSuffixEvent(path.length, contribution, path.thp * cachedRadiance,
+                    path.russianRoulettePdf, false, true, 1.f, 0.f, 0u);
+                path.terminate();
+                return;
+            }
+        }
+#endif
 
         logPathVertex();
 
@@ -1428,6 +1475,13 @@ struct PathTracer
         if (path.length == path.pathBuilder.rcVertexLength)
         {
             path.pathBuilder.cachedRandomSeed = path.sg.getCurrentSeed();
+#if SHARC_ENABLE && !BPR
+            if (!path.enableRandomReplay)
+            {
+                path.pathBuilder.suffixRootSurvivalPdf = path.russianRoulettePdf;
+                path.pathBuilder.pathFlags.setSuffixRoot(path.getBounces(BounceType::Diffuse), path.getBounces(BounceType::Specular), path.previousDiffuse);
+            }
+#endif
         }
 
         // daqi: save the incoming direction on rcVertex
@@ -1798,12 +1852,43 @@ struct PathTracer
             path.pathBuilder.rcVertexLength = rcVertexLength;
             path.origin = rcVertexSd.computeNewRayOrigin(!tempPathReservoir.pathFlags.decodeIsTransmissionEvent(false));
 
+#if SHARC_ENABLE && !BPR
+            // Re-evaluate one seed's entire outgoing suffix. Group normalization
+            // prevents several old explicit endpoints from each claiming the same cache hit.
+            path.replaySuffixGroup = tempPathReservoir.pathFlags.isSuffixGroup();
+            if (path.replaySuffixGroup)
+            {
+                path.enableRandomReplay = false;
+                path.useHybridShift = true;
+                path.pathBuilder.init(path.sg);
+                path.pathBuilder.rcVertexHit = tempPathReservoir.rcVertexHit;
+                path.pathBuilder.rcVertexWi[0] = scatterDir;
+                path.pathBuilder.cachedRandomSeed = tempPathReservoir.rcRandomSeed;
+                path.pathBuilder.cachedJacobian = tempPathReservoir.cachedJacobian;
+                path.pathBuilder.pathFlags = tempPathReservoir.pathFlags;
+#if SHARC_STATS
+                InterlockedAdd(sharc.stats[10], 1u);
+#endif
+            }
+#endif
+
             path.pathBuilder.pathFlags.transferDeltaInformation(tempPathReservoir.pathFlags);
             path.pathBuilder.pathFlags.transferTransmissionInformation(tempPathReservoir.pathFlags);
             path.pathBuilder.pathFlags.transferSpecularBounceInformation(tempPathReservoir.pathFlags);
             path.pathReservoir.rcVertexIrradiance[0] = 0.f;
 
             generateReplayPrimaryScatterRay(path, rcVertexSd, scatterDir);
+#if SHARC_ENABLE && !BPR
+            if (path.replaySuffixGroup)
+            {
+                ReSTIRPathFlags root = tempPathReservoir.pathFlags;
+                path.previousDiffuse = root.suffixDiffuseEdge();
+                path.setDelta(root.decodeIsDeltaEvent(false));
+                path.setBounces(BounceType::Diffuse, root.suffixDiffuseBounces());
+                path.setBounces(BounceType::Specular, root.suffixSpecularBounces());
+                path.setBounces(BounceType::Transmission, uint(rcVertexLength + 1) - root.suffixDiffuseBounces() - root.suffixSpecularBounces());
+            }
+#endif
             path.sg = SampleGenerator(tempPathReservoir.rcRandomSeed);
             if (path.isActive()) nextVertex(path);
 
@@ -1828,6 +1913,28 @@ struct PathTracer
             {
                 handleMiss(path);
             }
+
+#if SHARC_ENABLE && !BPR
+            if (path.replaySuffixGroup)
+            {
+                path.pathBuilder.finalizeSuffix(path.pathReservoir);
+                if (path.pathReservoir.weight <= 0.f)
+                {
+                    tempPathReservoir.rcVertexIrradiance[0] = 0.f;
+                    return;
+                }
+#if SHARC_STATS
+                bool oldCache = tempPathReservoir.pathFlags.isSharcTerminal();
+                bool newCache = path.pathReservoir.pathFlags.isSharcTerminal();
+                if (newCache && !oldCache) InterlockedAdd(sharc.stats[6], 1u);
+                if (!newCache && oldCache) InterlockedAdd(sharc.stats[7], 1u);
+                int depthChange = path.pathReservoir.pathFlags.pathLength() - tempPathReservoir.pathFlags.pathLength();
+                if (newCache && oldCache && depthChange < 0) InterlockedAdd(sharc.stats[8], 1u);
+                if (newCache && oldCache && depthChange > 0) InterlockedAdd(sharc.stats[9], 1u);
+#endif
+                tempPathReservoir.pathFlags = path.pathReservoir.pathFlags;
+            }
+#endif
 
             // unlike traceRandomReplayPath(), we don't directly copy the path.pathReservoir.
             // this is because we start at path.length == 2, we can also terminate early,
