@@ -399,3 +399,11 @@ pybind11::bytes RTPT::getSharcTemporalReservoirs() const
         throw std::logic_error("Temporal reservoir readback requires Temporal reuse enabled and Spatial reuse disabled.");
     return readReservoirs(mpOutputReservoirs);
 }
+
+pybind11::bytes RTPT::getSharcSpatialReservoirs() const
+{
+    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
+    if (!mEnableSpatialReuse) throw std::logic_error("Spatial reservoir readback requires Spatial reuse enabled.");
+    // Odd round counts end in the per-sample buffer, even counts in the shared output.
+    return readReservoirs(mNumSpatialRounds % 2 ? mpTemporalReservoirs.back() : mpOutputReservoirs);
+}

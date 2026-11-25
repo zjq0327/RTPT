@@ -276,6 +276,7 @@ void RTPT::registerBindings(pybind11::module& m)
     pass.def("getSharcFreshReservoirs", &RTPT::getSharcFreshReservoirs);
     pass.def("getSharcTemporalStats", &RTPT::getSharcTemporalStats);
     pass.def("getSharcTemporalReservoirs", &RTPT::getSharcTemporalReservoirs);
+    pass.def("getSharcSpatialReservoirs", &RTPT::getSharcSpatialReservoirs);
     pass.def("clearSharc", [](RTPT& pt) { pt.mSharcNeedsClear = true; });
     pass.def_property_readonly("reservoirStride", [](const RTPT& pt)
     {
@@ -354,8 +355,6 @@ bool RTPT::parseDictionary(const Dictionary& dict)
     // Reject incompatible configurations before mutating either the cache or the reuse settings.
     const auto requested = [&](const char* key, bool current) { return dict.keyExists(key) ? bool(dict[key]) : current; };
     const bool generateQuery = requested("enableSHARC", mEnableSharc) && requested("sharcUseCache", mSharcUseCache);
-    if (generateQuery && requested("enableSpatialReuse", mEnableSpatialReuse))
-        throw std::invalid_argument("SHaRC cache queries require enableSpatialReuse=false.");
     const bool queryStats = generateQuery && requested("sharcGenerateStats", mSharcGenerateStats);
     const uint32_t debugMode = dict.keyExists("sharcDebugMode") ? uint32_t(dict["sharcDebugMode"]) : mSharcDebugMode;
     if (debugMode > 3 || (debugMode && !queryStats))
@@ -801,7 +800,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
         if (group.checkbox("Enable SHaRC", mEnableSharc))
         {
             mRecompile = true;
-            if (!mEnableSharc || mEnableSpatialReuse)
+            if (!mEnableSharc)
             {
                 dirty |= mSharcUseCache;
                 mSharcUseCache = false;
@@ -813,16 +812,12 @@ void RTPT::renderUI(Gui::Widgets& widget)
         group.tooltip("Training paths per pixel from the starting camera. Changes apply on the next scene load or when the cache is enabled again. Zero skips pretraining.");
         if (mEnableSharc)
         {
-            if (!mEnableSpatialReuse)
+            if (group.checkbox("Use SHaRC in Generate and Temporal", mSharcUseCache))
             {
-                if (group.checkbox("Use SHaRC in Generate and Temporal", mSharcUseCache))
-                {
-                    mRecompile = true;
-                    dirty = true;
-                    if (!mSharcUseCache) mSharcDebugMode = mSharcTemporalDebugMode = 0;
-                }
+                mRecompile = true;
+                dirty = true;
+                if (!mSharcUseCache) mSharcDebugMode = mSharcTemporalDebugMode = 0;
             }
-            else group.text("Disable Spatial reuse to query SHaRC.");
             group.checkbox("Freeze cache updates", mSharcFreeze);
             if (group.button("Clear cache")) mSharcNeedsClear = true;
         }
@@ -891,8 +886,7 @@ bool RTPT::renderRenderingUI(Gui::Widgets& widget)
         if (mParams.rejectShiftBasedOnJacobian)
             dirty |= widget.var("Shift rejection jacobian threshold", mParams.jacobianRejectionThreshold, 0.f, 100.f);
         dirty |= widget.var("Specular roughness threshold", mParams.specularRoughnessThreshold, 0.f, 1.f);
-        if (querySharcInGenerate()) widget.text("Disable SHaRC queries to enable Spatial reuse.");
-        else dirty |= widget.checkbox("Spatial Reuse", mEnableSpatialReuse);
+        dirty |= widget.checkbox("Spatial Reuse", mEnableSpatialReuse);
         dirty |= widget.checkbox("Temporal Reuse", mEnableTemporalReuse);
         if (!mEnableTemporalReuse) mSharcTemporalDebugMode = 0;
 

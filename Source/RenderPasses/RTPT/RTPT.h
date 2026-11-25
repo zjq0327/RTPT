@@ -66,6 +66,7 @@ private:
     std::vector<uint32_t> getSharcTemporalStats() const;
     pybind11::bytes getSharcFreshReservoirs() const;
     pybind11::bytes getSharcTemporalReservoirs() const;
+    pybind11::bytes getSharcSpatialReservoirs() const;
     bool querySharcInGenerate() const { return mEnableSharc && mSharcUseCache; }
     bool querySharcInTemporal() const { return mEnableTemporalReuse && mSharcTemporalUseCache && querySharcInGenerate(); }
     void prepareMaterials(RenderContext* pRenderContext);
