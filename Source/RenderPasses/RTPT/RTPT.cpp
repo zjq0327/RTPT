@@ -176,7 +176,6 @@ namespace
     const std::string kUseDirectLighting = "useDirectLighting";
     const std::string kSeparatePathBSDF = "separatePathBSDF";
     const std::string kCandidateSamples = "candidateSamples";
-    const std::string kGroupGenerateSuffix = "groupGenerateSuffix";
     const std::string kTemporalUpdateForDynamicScene = "temporalUpdateForDynamicScene";
     const std::string kEnableRayStats = "enableRayStats";
 
@@ -198,10 +197,26 @@ extern "C" __declspec(dllexport) void getPasses(Falcor::RenderPassLibrary & lib)
 
 void RTPT::updateDict(const Dictionary& dict)
 {
+    const bool hasEnable = dict.keyExists("enableSHARC");
+    const bool hasFreeze = dict.keyExists("sharcFreeze");
+    if ((hasEnable || hasFreeze) && dict.size() == size_t(hasEnable) + size_t(hasFreeze))
+    {
+        // Cache writes are independent of the visible estimator and its random sequence.
+        if (hasEnable)
+        {
+            const bool enable = dict["enableSHARC"];
+            mRecompile |= enable != mEnableSharc;
+            mEnableSharc = enable;
+        }
+        if (hasFreeze) mSharcFreeze = dict["sharcFreeze"];
+        return;
+    }
+    const auto trainingSettings = getSharcTrainingSettings();
     bool needToReset = parseDictionary(dict);
     if (needToReset)
     {
         validateOptions();
+        mSharcNeedsClear |= trainingSettings != getSharcTrainingSettings() || dict.keyExists(kLightBVHOptions);
         mOptionsChanged = true;
         mRecompile = true;
         mParams.frameCount = 0;
@@ -216,6 +231,9 @@ void RTPT::initDict()
     const auto frameDim = mParams.frameDim;
     const auto screenTiles = mParams.screenTiles;
     Init();
+    mEnableSharc = false;
+    mSharcFreeze = false;
+    mSharcNeedsClear = true;
     mJacobianRejectionOverride = false;
     mTemporalUpdateOverride = false;
     mParams.frameDim = frameDim;
@@ -237,6 +255,8 @@ void RTPT::registerBindings(pybind11::module& m)
 {
     pybind11::class_<RTPT, RenderPass, RTPT::SharedPtr> pass(m, "RTPT");
     pass.def_property_readonly("pixelStats", &RTPT::getPixelStats);
+    pass.def("getSharcStats", &RTPT::getSharcStats);
+    pass.def("clearSharc", [](RTPT& pt) { pt.mSharcNeedsClear = true; });
     pass.def_property_readonly("reservoirStride", [](const RTPT& pt)
     {
         return pt.mpOutputReservoirs ? pt.mpOutputReservoirs->getElementSize() : 0u;
@@ -378,7 +398,8 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kUseDirectLighting) mUseDirectLighting = value;
         else if (key == kSeparatePathBSDF) mStaticParams.separatePathBSDF = value;
         else if (key == kCandidateSamples) mStaticParams.candidateSamples = value;
-        else if (key == kGroupGenerateSuffix) mStaticParams.groupGenerateSuffix = value;
+        else if (key == "enableSHARC") mEnableSharc = value;
+        else if (key == "sharcFreeze") mSharcFreeze = value;
         else if (key == kTemporalUpdateForDynamicScene)
         {
             mStaticParams.temporalUpdateForDynamicScene = value;
@@ -537,7 +558,8 @@ Dictionary RTPT::getScriptingDictionary()
     d[kUseDirectLighting] = mUseDirectLighting;
     d[kSeparatePathBSDF] = mStaticParams.separatePathBSDF;
     d[kCandidateSamples] = mStaticParams.candidateSamples;
-    d[kGroupGenerateSuffix] = mStaticParams.groupGenerateSuffix;
+    d["enableSHARC"] = mEnableSharc;
+    d["sharcFreeze"] = mSharcFreeze;
     d[kTemporalUpdateForDynamicScene] = mStaticParams.temporalUpdateForDynamicScene;
     d[kEnableRayStats] = mEnableRayStats;
     // Denoising parameters
@@ -585,6 +607,10 @@ void RTPT::compile(RenderContext* pContext, const CompileData& compileData)
 void RTPT::setScene(RenderContext* pRenderContext, const Scene::SharedPtr& pScene)
 {
     mpScene = pScene;
+    mSharcNeedsClear = true;
+    mSharcPreviousBounds.clear();
+    mSharcMotionBounds.clear();
+    mpSharcUpdate.reset();
     mParams.frameCount = 0;
     mReservoirFrameCount = 0;
 
@@ -636,6 +662,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             // Prepare the path tracer parameter block.
             // This should be called after all resources have been created.
             preparePathTracer(renderData);
+            if (restir_i == 0 && mEnableSharc) updateSharc(pRenderContext);
 
             // Reset atomic counters.
 
@@ -688,6 +715,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
 void RTPT::renderUI(Gui::Widgets& widget)
 {
+    const auto trainingSettings = getSharcTrainingSettings();
     bool dirty = false;
 
     // Rendering options.
@@ -697,10 +725,20 @@ void RTPT::renderUI(Gui::Widgets& widget)
     dirty |= renderStatsUI(widget);
 
     dirty |= renderDebugUI(widget);
+    if (auto group = widget.group("SHaRC radiance cache"))
+    {
+        if (group.checkbox("Train SHaRC", mEnableSharc)) mRecompile = true;
+        if (mEnableSharc)
+        {
+            group.checkbox("Freeze cache updates", mSharcFreeze);
+            if (group.button("Clear cache")) mSharcNeedsClear = true;
+        }
+    }
 
     if (dirty)
     {
         validateOptions();
+        mSharcNeedsClear |= trainingSettings != getSharcTrainingSettings();
         mOptionsChanged = true;
     }
 }
@@ -864,9 +902,6 @@ bool RTPT::renderRenderingUI(Gui::Widgets& widget)
         dirty |= widget.checkbox("Next-event estimation (NEE)", mStaticParams.useNEE);
         widget.tooltip("Use next-event estimation.\nThis option enables direct illumination sampling at each path vertex.");
 
-        dirty |= widget.checkbox("Group Generate suffix events", mStaticParams.groupGenerateSuffix);
-        widget.tooltip("Select one endpoint within the suffix, then merge it with the reconnection vertex's NEE sample.");
-
         if (mStaticParams.useNEE)
         {
             dirty |= widget.checkbox("Multiple importance sampling (MIS)", mStaticParams.useMIS);
@@ -1004,6 +1039,7 @@ void RTPT::updatePrograms()
     if (mRecompile == false) return;
 
     auto defines = mStaticParams.getDefines(*this);
+    specializeSharc(defines);
 
     // Update program specialization. This is done through defines in lieu of specialization constants.
     mpGeneratePaths->getProgram()->addDefines(defines);
@@ -1302,6 +1338,7 @@ bool RTPT::beginFrame(RenderContext* pRenderContext, const RenderData& renderDat
 
     // Update the env map and emissive sampler to the current frame.
     bool lightingChanged = prepareLighting(pRenderContext);
+    if (mEnableSharc) trackSharcMotion(lightingChanged);
 
     // Update refresh flag if changes that affect the output have occured.
     auto& dict = renderData.getDictionary();
@@ -1322,6 +1359,7 @@ bool RTPT::beginFrame(RenderContext* pRenderContext, const RenderData& renderDat
     if (gbufferAdjustShadingNormals != mGBufferAdjustShadingNormals)
     {
         mGBufferAdjustShadingNormals = gbufferAdjustShadingNormals;
+        mSharcNeedsClear = true;
         mRecompile = true;
     }
 
@@ -1518,7 +1556,6 @@ Program::DefineList RTPT::StaticParams::getDefines(const RTPT& owner) const
     // Path tracer configuration.
     defines.add("SAMPLES_PER_PIXEL", std::to_string(samplesPerPixel)); // 0 indicates a variable sample count
     defines.add("CANDIDATE_SAMPLES", std::to_string(candidateSamples)); // 0 indicates a variable sample count    
-    defines.add("GROUP_GENERATE_SUFFIX", groupGenerateSuffix ? "1" : "0");
     defines.add("MAX_SURFACE_BOUNCES", std::to_string(maxSurfaceBounces));
     defines.add("MAX_DIFFUSE_BOUNCES", std::to_string(maxDiffuseBounces));
     defines.add("MAX_SPECULAR_BOUNCES", std::to_string(maxSpecularBounces));

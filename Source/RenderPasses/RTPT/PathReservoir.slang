@@ -182,7 +182,7 @@ struct TriMeshHitInfo
     }
 };
 
-// Fixed reconnection layout: 88 bytes per reservoir.
+// Fixed reconnection layout: 84 bytes per reservoir.
 struct PathReservoir
 {
     float M = 0.f; // this is a float, because temporal history length is allowed to be a fraction. 
@@ -192,7 +192,6 @@ struct PathReservoir
     float3 F = 0.f; // cached integrand (always updated after a new path is chosen in RIS)
     float lightPdf; // NEE light pdf (might change after shift if transmission is included since light sampling considers "upperHemisphere" of the previous bounce)
     float3 cachedJacobian; // Two scatter PDFs and a geometry term.
-    float suffixRISWeight; // Correction already applied to F and irradiance. Preserve it across temporal replay.
     TriMeshHitInfo rcVertexHit; // hitinfo of the reconnection vertex
     float3 rcVertexWi[kRcAttrCount]; // incident direction on reconnection vertex
     float3 rcVertexIrradiance[kRcAttrCount]; // sampled irradiance on reconnection vertex
@@ -205,7 +204,6 @@ struct PathReservoir
         pathFlags.flags = 0;
         pathFlags.insertRcVertexLength(kMaximumPathLength);
         F = 0.f;
-        suffixRISWeight = 1.f;
 
         // set rcVertex as invalid
         rcVertexHit.instanceID = 0xffffffff;
@@ -261,7 +259,6 @@ struct PathReservoir
         {
             pathFlags = inReservoir.pathFlags;
             rcRandomSeed = inReservoir.rcRandomSeed;
-            suffixRISWeight = inReservoir.suffixRISWeight;
             cachedJacobian = inReservoir.cachedJacobian;
             lightPdf = inReservoir.lightPdf;
             rcVertexWi[0] = inReservoir.rcVertexWi[0];
@@ -290,7 +287,6 @@ struct PathReservoir
         {
             pathFlags = inReservoir.pathFlags;
             rcRandomSeed = inReservoir.rcRandomSeed;
-            suffixRISWeight = inReservoir.suffixRISWeight;
             cachedJacobian = inReservoir.cachedJacobian;
             lightPdf = inReservoir.lightPdf;
             rcVertexWi[0] = inReservoir.rcVertexWi[0];
@@ -319,7 +315,6 @@ struct PathReservoir
         {
             pathFlags = inReservoir.pathFlags;
             rcRandomSeed = inReservoir.rcRandomSeed;
-            suffixRISWeight = inReservoir.suffixRISWeight;
             cachedJacobian = inReservoir.cachedJacobian;
             lightPdf = inReservoir.lightPdf;
             rcVertexWi[0] = inReservoir.rcVertexWi[0];

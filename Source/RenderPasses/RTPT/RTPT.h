@@ -55,6 +55,11 @@ private:
     void setNRDData(const ShaderVar& var, const RenderData& renderData) const;
     void preparePathTracer(const RenderData& renderData);
     void resetLighting();
+    void specializeSharc(const Program::DefineList& defines);
+    void bindSharc(const ShaderVar& var) const;
+    void trackSharcMotion(bool lightingChanged);
+    void updateSharc(RenderContext* pRenderContext);
+    pybind11::dict getSharcStats() const;
     void prepareMaterials(RenderContext* pRenderContext);
     bool prepareLighting(RenderContext* pRenderContext);
     void setShaderData(const ShaderVar& var, const RenderData& renderData, bool isPathTracer, bool isPathGenerator) const;
@@ -75,7 +80,6 @@ private:
         // Rendering parameters
         uint32_t    samplesPerPixel = 1;                        ///< Number of samples (paths) per pixel, unless a sample density map is used.
         uint32_t    candidateSamples = 1;
-		bool        groupGenerateSuffix = false;               ///< Select one suffix endpoint before merging with the reconnection vertex's NEE sample.
         uint32_t    maxSurfaceBounces = 9;                      ///< Max number of surface bounces (diffuse + specular + transmission), up to kMaxPathLenth.
         uint32_t    maxDiffuseBounces = -1;                     ///< Max number of diffuse bounces (0 = direct only), up to kMaxBounces. This will be initialized at startup.
         uint32_t    maxSpecularBounces = -1;                    ///< Max number of specular bounces (0 = direct only), up to kMaxBounces. This will be initialized at startup.
@@ -136,6 +140,18 @@ private:
         mNoResamplingForTemporalReuse = false;
     }
 
+    // Cache training depends on transport settings even when the visible path is unchanged.
+    auto getSharcTrainingSettings() const
+    {
+        const auto& p = mStaticParams;
+        return std::make_tuple(p.maxSurfaceBounces, p.maxDiffuseBounces, p.maxSpecularBounces, p.maxTransmissionBounces,
+            p.useNEE, p.useMIS, p.misHeuristic, p.misPowerExponent, p.disableCaustics, p.useBSDFSampling,
+            p.useDeterministicBSDF, p.separatePathBSDF, p.useRussianRoulette, p.adjustShadingNormals, p.useAlphaTest,
+            p.maxNestedMaterials, p.useLightsInDielectricVolumes, p.limitTransmission, p.maxTransmissionReflectionDepth,
+            p.maxTransmissionRefractionDepth, p.disableDirectIllumination, p.primaryLodMode, p.emissiveSampler,
+            mParams.lodBias, mParams.specularRoughnessThreshold);
+    }
+
     // Configuration
     RestirPathTracerParams          mParams;                    ///< Runtime path tracer parameters.
     StaticParams                    mStaticParams;              ///< Static parameters. These are set as compile-time constants in the shaders.
@@ -151,6 +167,27 @@ private:
     PixelStats::SharedPtr           mpPixelStats;               ///< Utility class for collecting pixel stats.
     PixelDebug::SharedPtr           mpPixelDebug;               ///< Utility class for pixel debugging (print in shaders).
     ParameterBlock::SharedPtr       mpPathTracerBlock;          ///< Parameter block for the path tracer.
+
+    bool                            mEnableSharc = false;
+    bool                            mSharcFreeze = false;
+    bool                            mSharcNeedsClear = true;
+    uint32_t                        mSharcFrameIndex = 0;
+    uint64_t                        mSharcUpdateCount = 0, mSharcResolveCount = 0;
+    uint64_t                        mSharcClearCount = 0, mSharcInvalidateCount = 0;
+    struct SharcGrid
+    {
+        float3 cameraPosition = float3(0.f);
+        float sceneScale = 16.f;
+        float logarithmBase = 2.f;
+        float levelBias = 0.f;
+    };
+    SharcGrid                       mSharcPublishedGrid;
+    uint64_t                        mSharcPublishedVersion = 0;
+    float3                          mSharcPreviousCamera = float3(0.f);
+    std::vector<AABB>               mSharcPreviousBounds;
+    std::vector<float4>             mSharcMotionBounds;
+    ComputePass::SharedPtr          mpSharcUpdate, mpSharcResolve, mpSharcInvalidate;
+    Buffer::SharedPtr               mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved, mpSharcMotionBounds;
 
     // internal below
     bool                            mRecompile = false;         ///< Set to true when program specialization has changed.

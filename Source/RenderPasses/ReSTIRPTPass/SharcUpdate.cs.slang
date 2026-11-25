@@ -2,9 +2,11 @@ import Scene.Scene;
 import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Materials.MaterialShading;
 import Utils.Math.HashUtils;
+#ifndef SHARC_FIXED_X1_TRAINER
 import LoadShadingData;
 import PathTracer;
 import SharcCache;
+#endif
 
 ParameterBlock<PathTracer> gPathTracer;
 
@@ -137,7 +139,9 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             if (gPathTracer.terminatePathByRussianRoulette(path)) break;
             // Explicit ReSTIR candidates divide by their survival density in RIS.
             // Raw PathTracing accumulates its surviving path.L directly.
+#ifndef SHARC_FIXED_X1_TRAINER
             if (PathSamplingMode(kPathSamplingMode) != PathSamplingMode::PathTracing)
+#endif
                 survival = path.russianRoulettePdf;
             path.prefixThp = 1.f;
         }

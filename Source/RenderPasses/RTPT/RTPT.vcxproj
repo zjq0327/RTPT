@@ -70,6 +70,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="RTPT.cpp" />
+    <ClCompile Include="RTPTSharc.cpp" />
+    <SharcSharedShader Include="..\ReSTIRPTPass\SharcCache.slang;..\ReSTIRPTPass\SharcInvalidate.cs.slang;..\ReSTIRPTPass\SharcResolve.cs.slang;..\ReSTIRPTPass\SharcUpdate.cs.slang" />
+    <SharcSdkFile Include="..\ReSTIRPTPass\ThirdParty\SHARC\*.h;..\ReSTIRPTPass\ThirdParty\SHARC\License.md" />
     <ClInclude Include="RTPT.h" />
     <ShaderSource Include="*.slang" />
     <None Include="..\..\Mogwai\Data\RTPTFixedX1.py" />
@@ -82,6 +85,8 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="DeployRTPTData" BeforeTargets="Build">
+    <Copy SourceFiles="@(SharcSharedShader)" DestinationFolder="$(OutDir)Shaders\RenderPasses\ReSTIRPTPass" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(SharcSdkFile)" DestinationFolder="$(OutDir)Shaders\RenderPasses\ReSTIRPTPass\ThirdParty\SHARC" SkipUnchangedFiles="true" />
     <Copy SourceFiles="..\..\Mogwai\Data\RTPTFixedX1.py" DestinationFolder="$(OutDir)Data" SkipUnchangedFiles="true" />
   </Target>
 </Project>

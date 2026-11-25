@@ -34,6 +34,10 @@ import PathReservoir;
 __exported import PathState;
 __exported import Params;
 
+#ifndef SHARC_TRAINING
+#define SHARC_TRAINING 0
+#endif
+
 uint getAllowedBSDFFlags(bool isSpecularBounce)
 {
     if (kSeparatePathBSDF) return isSpecularBounce ? 0xc : 0x3;
@@ -331,7 +335,10 @@ struct PathTracer
 #endif
 
             path.clearEventFlags();
-
+#if SHARC_TRAINING
+            path.previousRoughness = sd.linearRoughness;
+            path.previousDiffuse = result.isLobe(LobeType::DiffuseReflection);
+#endif
 
             // Handle reflection events.
 
@@ -942,6 +949,13 @@ struct PathTracer
         return loadShadingData(path.hit, -path.dir, path.length == 0, path.length > 0 ? params.lodBias : 0.f);
     }
 
+#if SHARC_TRAINING
+    bool allowsSharcDepth(PathState path)
+    {
+        return path.length >= SHARC_MIN_DEPTH && path.length < kMaximumPathLength &&
+            (path.length < 4 || path.previousDiffuse) && !path.isTransmission() && !hasFinishedSurfaceBounces(path);
+    }
+#endif
 
     /** Handle the case when a scatter ray hits the scene.
         After handling the hit, a new scatter ray is generated or the path is terminated.
@@ -1218,9 +1232,6 @@ struct PathTracer
         if (path.length == path.pathBuilder.rcVertexLength)
         {
             path.pathBuilder.cachedRandomSeed = path.sg.getCurrentSeed();
-#if GROUP_GENERATE_SUFFIX
-            path.pathBuilder.suffixRootSurvivalPdf = path.russianRoulettePdf;
-#endif
         }
 
         // daqi: save the incoming direction on rcVertex
@@ -1413,9 +1424,6 @@ struct PathTracer
             }
 
             tempPathReservoir.rcVertexIrradiance[0] = path.pathReservoir.rcVertexIrradiance[0];
-#if GROUP_GENERATE_SUFFIX
-            tempPathReservoir.rcVertexIrradiance[0] *= tempPathReservoir.suffixRISWeight;
-#endif
             tempPathReservoir.lightPdf = path.pathReservoir.lightPdf;
             tempPathReservoir.pathFlags.insertLightType(path.pathReservoir.pathFlags.lightType());
         }
@@ -1425,7 +1433,8 @@ struct PathTracer
     */
     void finalize(inout PathState path)
     {
-        path.pathBuilder.finalize(path.pathReservoir);
+        // All endpoint candidates came from one sampled path.
+        path.pathReservoir.M = 1;
     }
 
     ShadingData loadNRDPrimarySurface(uint2 pixel)

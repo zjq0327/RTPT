@@ -8,6 +8,10 @@ __exported import Scene.HitInfo;
 __exported import Utils.Sampling.SampleGenerator;
 import Rendering.Materials.InteriorListHelpers;
 
+#ifndef SHARC_TRAINING
+#define SHARC_TRAINING 0
+#endif
+
 static const uint kMaxRejectedHits = 16; // Maximum number of rejected hits along a path. The path is terminated if the limit is reached to avoid getting stuck in pathological cases.
 
 static const float kRayTMax = 1e30f;
@@ -86,6 +90,10 @@ struct PathState
 
     float      russianRoulettePdf = 1.f;
     float      prevScatterPdf = 1.f;
+#if SHARC_TRAINING
+    float previousRoughness;
+    bool previousDiffuse;
+#endif
     float hitDist; // for NRD
 
     InteriorList interiorList;      ///< Interior list. Keeping track of a stack of materials with medium properties.
