@@ -59,8 +59,17 @@ private:
     void bindSharc(const ShaderVar& var) const;
     void trackSharcMotion(bool lightingChanged);
     void updateSharc(RenderContext* pRenderContext);
-    void traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride);
+    void traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainPG = false);
     void resolveSharcTraining(RenderContext* pRenderContext);
+    void preparePG(RenderContext* pRenderContext);
+    void releasePG();
+    void bindPGTraining(const ShaderVar& var) const;
+    void bindPGRead(const ShaderVar& var, bool previousFrame) const;
+    void barrierPGTraining(RenderContext* pRenderContext) const;
+    void notePGTraining(uint32_t stride, bool pretrain);
+    void finishPGTraining(RenderContext* pRenderContext, bool immediate);
+    void publishPG(RenderContext* pRenderContext);
+    pybind11::dict getPGStats() const;
     pybind11::dict getSharcStats() const;
     pybind11::dict getSharcGenerateStats() const;
     std::vector<uint32_t> getSharcTemporalStats() const;
@@ -187,6 +196,7 @@ private:
     uint32_t                        mSharcTemporalDebugMode = 0;
     uint32_t                        mSharcTemporalDebugDepth = 2;
     Buffer::SharedPtr               mpSharcGenerateStats;
+    Buffer::SharedPtr               mpSharcTrainingStats;
     Buffer::SharedPtr               mpSharcTemporalStats;
     bool                            mSharcNeedsClear = true;
     bool                            mSharcPretrainPending = true;
@@ -210,6 +220,31 @@ private:
     std::vector<float4>             mSharcMotionBounds;
     ComputePass::SharedPtr          mpSharcUpdate, mpSharcResolve, mpSharcInvalidate;
     Buffer::SharedPtr               mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved, mpSharcMotionBounds;
+
+    bool                            mEnablePG = false;
+    ComputePass::SharedPtr          mpSharcPGUpdate, mpPGPublish;
+    Buffer::SharedPtr               mpPGBuildKeys, mpPGAccumulation, mpPGCounts, mpPGDiagnostics;
+    Buffer::SharedPtr               mpPGHistoryMean, mpPGHistoryCount;
+    static constexpr uint32_t       kPGCapacity = 65536;
+    static constexpr float          kDefaultPGSceneScale = 8.f;
+    float                           mPGSceneScale = kDefaultPGSceneScale;
+    bool                            mPGResetPending = false, mPGCarryPrevious = true;
+    struct PGSnapshot
+    {
+        Buffer::SharedPtr keys, mass;
+        float3 cameraPosition = float3(0.f);
+        float sceneScale = kDefaultPGSceneScale;
+        uint64_t version = 0;
+    };
+    PGSnapshot                      mPGSnapshots[2];
+    uint32_t                        mPGCurrent = 0, mPGPrevious = 0;
+    bool                            mPGPublishPending = false, mPGPublishedThisFrame = false;
+    float3                          mPGTrainingCamera = float3(0.f);
+    uint64_t                        mPGRuntimeFrameCount = 0, mPGPublications = 0;
+    uint64_t                        mPGPretrainDispatches = 0, mPGRuntimeDispatches = 0;
+    uint64_t                        mPGPretrainPaths = 0, mPGRuntimePaths = 0;
+    uint64_t                        mPGLastTrainingFrame = 0;
+    uint32_t                        mPGLastTrainingSample = 0;
 
     // internal below
     bool                            mRecompile = false;         ///< Set to true when program specialization has changed.

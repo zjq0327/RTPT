@@ -10,6 +10,8 @@ namespace
     constexpr uint32_t kSharcCapacity = 1u << 20;
     constexpr uint32_t kSharcUpdateStride = 5;
     constexpr uint32_t kSharcPretrainBatchSpp = 8;
+    constexpr uint32_t kPGTrainingInterval = 4;
+    constexpr uint32_t kTrainingCounterCount = 6;
     constexpr uint32_t kGenerateDepthCount = 16;
     constexpr uint32_t kGenerateMetricCount = 8;
     constexpr uint32_t kGenerateProbeOffset = kGenerateDepthCount * kGenerateMetricCount;
@@ -38,6 +40,17 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
             Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
     else if (!mSharcGenerateStats) mpSharcGenerateStats.reset();
 
+    if (mEnableSharc && mSharcGenerateStats)
+    {
+        if (!mpSharcTrainingStats)
+        {
+            const std::array<uint32_t, kTrainingCounterCount> zeros{};
+            mpSharcTrainingStats = Buffer::createStructured(sizeof(uint32_t), kTrainingCounterCount,
+                Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, zeros.data(), false);
+        }
+    }
+    else mpSharcTrainingStats.reset();
+
     const bool collectTemporal = mSharcGenerateStats && querySharcInTemporal();
     if (collectTemporal && !mpSharcTemporalStats)
         mpSharcTemporalStats = Buffer::createStructured(sizeof(uint32_t), kTemporalCounterCount,
@@ -47,6 +60,7 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
     if (!mEnableSharc)
     {
         mpSharcUpdate.reset();
+        mpSharcPGUpdate.reset();
         mpSharcResolve.reset();
         mpSharcInvalidate.reset();
         mpSharcMotionBounds.reset();
@@ -60,19 +74,28 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
     }
     auto updateDefines = defines;
     updateDefines.add("SHARC_TRAINING", "1");
+    updateDefines.add("SHARC_TRAINING_STATS", mSharcGenerateStats ? "1" : "0");
     updateDefines.add(mpScene->getSceneDefines());
     if (mpEmissiveSampler) updateDefines.add(mpEmissiveSampler->getDefines());
-    if (!mpSharcUpdate)
+    auto specializeTrainer = [&](ComputePass::SharedPtr& pass, bool collectPG)
     {
-        Program::Desc desc;
-        desc.addShaderLibrary(kSharcUpdateFile).csEntry("main").setShaderModel("6_5");
-        mpSharcUpdate = ComputePass::create(desc, updateDefines, true);
-    }
-    else
-    {
-        mpSharcUpdate->getProgram()->setDefines(updateDefines);
-        mpSharcUpdate->setVars(nullptr);
-    }
+        auto trainerDefines = updateDefines;
+        trainerDefines.add("PG_TRAINING", collectPG ? "1" : "0");
+        if (!pass)
+        {
+            Program::Desc desc;
+            desc.addShaderLibrary(kSharcUpdateFile).csEntry("main").setShaderModel("6_5");
+            pass = ComputePass::create(desc, trainerDefines, true);
+        }
+        else
+        {
+            pass->getProgram()->setDefines(trainerDefines);
+            pass->setVars(nullptr);
+        }
+    };
+    specializeTrainer(mpSharcUpdate, false);
+    if (mEnablePG) specializeTrainer(mpSharcPGUpdate, true);
+    else mpSharcPGUpdate.reset();
     if (!mpSharcResolve)
     {
         Program::Desc desc;
@@ -101,6 +124,9 @@ void RTPT::bindSharc(const ShaderVar& var) const
 
 void RTPT::updateSharc(RenderContext* pRenderContext)
 {
+    // Called once per displayed frame, including the scene-load and frozen frames.
+    if (mEnablePG) ++mPGRuntimeFrameCount;
+    const bool captureSparsePG = mEnablePG && mPGRuntimeFrameCount % kPGTrainingInterval == 0;
     if (!mpSharcKeys)
     {
         const auto flags = Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess;
@@ -120,6 +146,11 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         ++mSharcClearCount;
         mSharcFrameIndex = 0;
         mSharcMotionBounds.clear();
+        if (mpSharcTrainingStats)
+        {
+            pRenderContext->clearUAV(mpSharcTrainingStats->getUAV().get(), uint4(0));
+            pRenderContext->uavBarrier(mpSharcTrainingStats.get());
+        }
         for (const auto& buffer : buffers)
         {
             pRenderContext->clearUAV(buffer->getUAV().get(), uint4(0));
@@ -161,7 +192,8 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
                 const uint32_t batch = std::min(mSharcPretrainSpp - mSharcPretrainedSpp, kSharcPretrainBatchSpp);
                 for (uint32_t i = 0; i < batch; ++i)
                 {
-                    traceSharcTrainingPaths(pRenderContext, 1u);
+                    traceSharcTrainingPaths(pRenderContext, 1u, mEnablePG);
+                    if (mEnablePG) notePGTraining(1u, true);
                     resolveSharcTraining(pRenderContext);
                     ++mSharcPretrainedSpp;
                 }
@@ -170,7 +202,11 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
             if (mSharcPretrainedSpp < mSharcPretrainSpp) pRenderContext->flush(true);
         }
         mSharcPretrainPending = false;
-        if (mSharcPretrainedSpp > 0) return;
+        if (mSharcPretrainedSpp > 0)
+        {
+            if (mEnablePG) finishPGTraining(pRenderContext, true);
+            return;
+        }
     }
     if (mSharcFreeze)
     {
@@ -179,18 +215,21 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
     }
     {
         PROFILE("SHaRC SparseUpdate");
-        traceSharcTrainingPaths(pRenderContext, kSharcUpdateStride);
+        traceSharcTrainingPaths(pRenderContext, kSharcUpdateStride, captureSparsePG);
+        if (captureSparsePG) notePGTraining(kSharcUpdateStride, false);
     }
     {
         PROFILE("SHaRC Resolve");
         resolveSharcTraining(pRenderContext);
     }
+    if (captureSparsePG) finishPGTraining(pRenderContext, false);
 }
 
-void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride)
+void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainPG)
 {
     ++mSharcUpdateCount;
-    auto var = mpSharcUpdate->getRootVar();
+    const auto& pass = trainPG ? mpSharcPGUpdate : mpSharcUpdate;
+    auto var = pass->getRootVar();
     mpScene->setRaytracingShaderData(pRenderContext, var);
     mpSampleGenerator->setShaderData(var);
     var["gPathTracer"] = mpPathTracerBlock;
@@ -198,7 +237,11 @@ void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t strid
     bindSharc(cb["gSharcWrite"]);
     cb["gSharcFrameIndex"] = mSharcFrameIndex;
     cb["gUpdateStride"] = stride;
-    mpSharcUpdate->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(stride)), 1u));
+    if (mpSharcTrainingStats) var["gSharcTrainingStats"] = mpSharcTrainingStats;
+    if (trainPG) bindPGTraining(cb["gPGWrite"]);
+    pass->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(stride)), 1u));
+    if (mpSharcTrainingStats) pRenderContext->uavBarrier(mpSharcTrainingStats.get());
+    if (trainPG) barrierPGTraining(pRenderContext);
     for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
         pRenderContext->uavBarrier(buffer.get());
 }
@@ -327,6 +370,14 @@ pybind11::dict RTPT::getSharcStats() const
     stats["clears"] = mSharcClearCount;
     stats["invalidations"] = mSharcInvalidateCount;
     stats["lastMotionBounds"] = mSharcMotionBounds.size() / 2;
+    if (mpSharcTrainingStats)
+    {
+        const char* names[kTrainingCounterCount] = {"trainingPaths", "trainingMainRays", "trainingShadowRays",
+            "trainingSurfaceHits", "trainingHashSum", "trainingHashXor"};
+        const auto* counters = static_cast<const uint32_t*>(mpSharcTrainingStats->map(Buffer::MapType::Read));
+        for (uint32_t i = 0; i < kTrainingCounterCount; ++i) stats[names[i]] = counters[i];
+        mpSharcTrainingStats->unmap();
+    }
     return stats;
 }
 

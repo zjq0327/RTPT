@@ -70,6 +70,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="RTPT.cpp" />
+    <ClCompile Include="RTPTPG.cpp" />
     <ClCompile Include="RTPTSharc.cpp" />
     <SharcSharedShader Include="..\ReSTIRPTPass\SharcCache.slang;..\ReSTIRPTPass\SharcInvalidate.cs.slang;..\ReSTIRPTPass\SharcResolve.cs.slang;..\ReSTIRPTPass\SharcUpdate.cs.slang" />
     <SharcSdkFile Include="..\ReSTIRPTPass\ThirdParty\SHARC\*.h;..\ReSTIRPTPass\ThirdParty\SHARC\License.md" />
