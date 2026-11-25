@@ -14,6 +14,9 @@ import Rendering.Materials.InteriorListHelpers;
 #ifndef SHARC_GENERATE_QUERY
 #define SHARC_GENERATE_QUERY 0
 #endif
+#ifndef SHARC_TEMPORAL_QUERY
+#define SHARC_TEMPORAL_QUERY 0
+#endif
 
 static const uint kMaxRejectedHits = 16; // Maximum number of rejected hits along a path. The path is terminated if the limit is reached to avoid getting stuck in pathological cases.
 
@@ -93,9 +96,18 @@ struct PathState
 
     float      russianRoulettePdf = 1.f;
     float      prevScatterPdf = 1.f;
-#if SHARC_TRAINING || SHARC_GENERATE_QUERY
+#if SHARC_TRAINING || SHARC_GENERATE_QUERY || SHARC_TEMPORAL_QUERY
     float previousRoughness;
     bool previousDiffuse;
+#endif
+#if SHARC_GENERATE_QUERY
+    uint sharcRootBounces;
+    bool sharcRootDiffuseLobe;
+    bool sharcPrimaryCountedDiffuse;
+    float sharcRootSurvival;
+#endif
+#if SHARC_TEMPORAL_QUERY
+    bool replaySharc;
 #endif
     float hitDist; // for NRD
 

@@ -63,8 +63,11 @@ private:
     void resolveSharcTraining(RenderContext* pRenderContext);
     pybind11::dict getSharcStats() const;
     pybind11::dict getSharcGenerateStats() const;
+    std::vector<uint32_t> getSharcTemporalStats() const;
     pybind11::bytes getSharcFreshReservoirs() const;
+    pybind11::bytes getSharcTemporalReservoirs() const;
     bool querySharcInGenerate() const { return mEnableSharc && mSharcUseCache; }
+    bool querySharcInTemporal() const { return mEnableTemporalReuse && mSharcTemporalUseCache && querySharcInGenerate(); }
     void prepareMaterials(RenderContext* pRenderContext);
     bool prepareLighting(RenderContext* pRenderContext);
     void setShaderData(const ShaderVar& var, const RenderData& renderData, bool isPathTracer, bool isPathGenerator) const;
@@ -176,9 +179,14 @@ private:
     bool                            mEnableSharc = false;
     bool                            mSharcFreeze = false;
     bool                            mSharcUseCache = false;
+    bool                            mSharcTemporalUseCache = true;
     bool                            mSharcGenerateStats = false;
     uint32_t                        mSharcDebugMode = 0;
+    uint32_t                        mSharcDebugDepth = 2;
+    uint32_t                        mSharcTemporalDebugMode = 0;
+    uint32_t                        mSharcTemporalDebugDepth = 2;
     Buffer::SharedPtr               mpSharcGenerateStats;
+    Buffer::SharedPtr               mpSharcTemporalStats;
     bool                            mSharcNeedsClear = true;
     bool                            mSharcPretrainPending = true;
     static constexpr uint32_t       kDefaultSharcPretrainSpp = 8;

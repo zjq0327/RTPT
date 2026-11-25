@@ -14,6 +14,9 @@ import Utils.Sampling.TinyUniformSampleGenerator;
 import Utils.Math.Ray;
 import LoadShadingData;
 import Rendering.Materials.MaterialShading;
+#if SHARC_TEMPORAL_STATS
+import SharcTemporalParams;
+#endif
 
 /** TODO.
 */
@@ -207,8 +210,10 @@ struct PathReusePass
                                 float p_ = 0.f;
                                 float tneighborJacobian;
 
+                                // Fresh already holds its current incident. Only reconnect
+                                // the previous primary surface for this reverse MIS target.
                                 float3 tneighborIntegrand = computeShiftedIntegrand(params, tneighborJacobian, temporalPrimarySd,
-                                    centralPrimarySd, tempDstReservoir, true);
+                                    centralPrimarySd, tempDstReservoir, true, true);
                                 p_ = PathReservoir::toScalar(tneighborIntegrand) * tneighborJacobian;
                                 p_sum += p_ * temporalReservoir.M;
                             }
@@ -220,7 +225,13 @@ struct PathReusePass
                     if (i == curSampleId) neighborReservoir = tempDstReservoir;
                     else neighborReservoir = temporalReservoir;
 
-                    mergeReservoirWithResamplingMIS(params, tempDstReservoir.F, dstJacobian, dstReservoir, tempDstReservoir, neighborReservoir, sg, false, misWeight);
+                    const bool selected = mergeReservoirWithResamplingMIS(params, tempDstReservoir.F, dstJacobian,
+                        dstReservoir, tempDstReservoir, neighborReservoir, sg, false, misWeight);
+#if SHARC_TEMPORAL_STATS
+                    // History is the final candidate, so acceptance here is the published winner.
+                    if (doTemporalUpdateForDynamicScene && i == prevSampleId && selected && dstReservoir.pathFlags.isSharcTerminal())
+                        countSharcTemporalDepth(SharcTemporalDepthStat::Winner, dstReservoir.pathFlags.pathLength());
+#endif
                 }
 
                 if (dstReservoir.weight > 0)
@@ -263,7 +274,7 @@ struct PathReusePass
                         float prefix_approxPdf;
 
                         float3 prefixIntegrand = computeShiftedIntegrand(params, prefixJacobian, temporalPrimarySd,
-                            centralPrimarySd, dstReservoir, true);
+                            centralPrimarySd, dstReservoir, true, true);
                         prefix_approxPdf = PathReservoir::toScalar(prefixIntegrand) * prefixJacobian;
 
                         if (prefix_approxPdf > 0.f)

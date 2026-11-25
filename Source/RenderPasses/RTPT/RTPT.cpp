@@ -200,17 +200,23 @@ void RTPT::updateDict(const Dictionary& dict)
 {
     const bool wasEnabled = mEnableSharc;
     const bool usedCache = querySharcInGenerate();
+    const bool usedTemporalCache = querySharcInTemporal();
     const bool collectedStats = mSharcGenerateStats;
     const uint32_t previousDebugMode = mSharcDebugMode;
+    const uint32_t previousDebugDepth = mSharcDebugDepth;
     const auto trainingSettings = getSharcTrainingSettings();
     bool needToReset = parseDictionary(dict);
     const size_t sharcOptionCount = size_t(dict.keyExists("enableSHARC")) + size_t(dict.keyExists("sharcFreeze")) +
         size_t(dict.keyExists("sharcUseCache")) + size_t(dict.keyExists("sharcGenerateStats")) +
-        size_t(dict.keyExists("sharcDebugMode")) + size_t(dict.keyExists(kSharcPretrainSpp));
+        size_t(dict.keyExists("sharcDebugMode")) + size_t(dict.keyExists("sharcDebugDepth")) +
+        size_t(dict.keyExists("sharcTemporalDebugMode")) + size_t(dict.keyExists("sharcTemporalDebugDepth")) +
+        size_t(dict.keyExists("sharcTemporalUseCache")) + size_t(dict.keyExists(kSharcPretrainSpp));
     if (sharcOptionCount && dict.size() == sharcOptionCount)
     {
-        mRecompile |= wasEnabled != mEnableSharc || usedCache != querySharcInGenerate() || collectedStats != mSharcGenerateStats;
-        mOptionsChanged |= usedCache != querySharcInGenerate() || previousDebugMode != mSharcDebugMode;
+        const bool queryChanged = usedCache != querySharcInGenerate() || usedTemporalCache != querySharcInTemporal();
+        mRecompile |= wasEnabled != mEnableSharc || queryChanged || collectedStats != mSharcGenerateStats;
+        mOptionsChanged |= queryChanged || previousDebugMode != mSharcDebugMode ||
+            (mSharcDebugMode && previousDebugDepth != mSharcDebugDepth);
         return;
     }
     if (needToReset)
@@ -234,8 +240,12 @@ void RTPT::initDict()
     mEnableSharc = false;
     mSharcFreeze = false;
     mSharcUseCache = false;
+    mSharcTemporalUseCache = true;
     mSharcGenerateStats = false;
     mSharcDebugMode = 0;
+    mSharcDebugDepth = 2;
+    mSharcTemporalDebugMode = 0;
+    mSharcTemporalDebugDepth = 2;
     mSharcNeedsClear = true;
     mSharcPretrainSpp = kDefaultSharcPretrainSpp;
     mSharcPretrainedSpp = 0;
@@ -264,6 +274,8 @@ void RTPT::registerBindings(pybind11::module& m)
     pass.def("getSharcStats", &RTPT::getSharcStats);
     pass.def("getSharcGenerateStats", &RTPT::getSharcGenerateStats);
     pass.def("getSharcFreshReservoirs", &RTPT::getSharcFreshReservoirs);
+    pass.def("getSharcTemporalStats", &RTPT::getSharcTemporalStats);
+    pass.def("getSharcTemporalReservoirs", &RTPT::getSharcTemporalReservoirs);
     pass.def("clearSharc", [](RTPT& pt) { pt.mSharcNeedsClear = true; });
     pass.def_property_readonly("reservoirStride", [](const RTPT& pt)
     {
@@ -342,11 +354,21 @@ bool RTPT::parseDictionary(const Dictionary& dict)
     // Reject incompatible configurations before mutating either the cache or the reuse settings.
     const auto requested = [&](const char* key, bool current) { return dict.keyExists(key) ? bool(dict[key]) : current; };
     const bool generateQuery = requested("enableSHARC", mEnableSharc) && requested("sharcUseCache", mSharcUseCache);
-    if (generateQuery && (requested("enableTemporalReuse", mEnableTemporalReuse) || requested("enableSpatialReuse", mEnableSpatialReuse)))
-        throw std::invalid_argument("SHaRC Generate queries require enableTemporalReuse=false and enableSpatialReuse=false.");
+    if (generateQuery && requested("enableSpatialReuse", mEnableSpatialReuse))
+        throw std::invalid_argument("SHaRC cache queries require enableSpatialReuse=false.");
+    const bool queryStats = generateQuery && requested("sharcGenerateStats", mSharcGenerateStats);
     const uint32_t debugMode = dict.keyExists("sharcDebugMode") ? uint32_t(dict["sharcDebugMode"]) : mSharcDebugMode;
-    if (debugMode > 3 || (debugMode && !(generateQuery && requested("sharcGenerateStats", mSharcGenerateStats))))
+    if (debugMode > 3 || (debugMode && !queryStats))
         throw std::invalid_argument("sharcDebugMode must be 0, or 1-3 with SHaRC Generate queries and sharcGenerateStats enabled.");
+    const uint32_t temporalDebugMode = dict.keyExists("sharcTemporalDebugMode") ? uint32_t(dict["sharcTemporalDebugMode"]) : mSharcTemporalDebugMode;
+    const bool temporalQueryStats = queryStats && requested("enableTemporalReuse", mEnableTemporalReuse) &&
+        requested("sharcTemporalUseCache", mSharcTemporalUseCache);
+    if (temporalDebugMode > 3 || (temporalDebugMode && !temporalQueryStats))
+        throw std::invalid_argument("sharcTemporalDebugMode must be 0, or 1-3 with Temporal SHaRC queries and sharcGenerateStats enabled.");
+    const uint32_t debugDepth = dict.keyExists("sharcDebugDepth") ? uint32_t(dict["sharcDebugDepth"]) : mSharcDebugDepth;
+    const uint32_t temporalDebugDepth = dict.keyExists("sharcTemporalDebugDepth") ? uint32_t(dict["sharcTemporalDebugDepth"]) : mSharcTemporalDebugDepth;
+    if (debugDepth < 2 || debugDepth > 15 || temporalDebugDepth < 2 || temporalDebugDepth > 15)
+        throw std::invalid_argument("SHaRC diagnostic query depths must be in [2, 15].");
     const uint32_t pretrainSpp = dict.keyExists(kSharcPretrainSpp) ? uint32_t(dict[kSharcPretrainSpp]) : mSharcPretrainSpp;
 
     bool needToReset = true;
@@ -419,8 +441,12 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == "enableSHARC") mEnableSharc = value;
         else if (key == "sharcFreeze") mSharcFreeze = value;
         else if (key == "sharcUseCache") mSharcUseCache = value;
+        else if (key == "sharcTemporalUseCache") mSharcTemporalUseCache = value;
         else if (key == "sharcGenerateStats") mSharcGenerateStats = value;
         else if (key == "sharcDebugMode") mSharcDebugMode = value;
+        else if (key == "sharcDebugDepth") mSharcDebugDepth = debugDepth;
+        else if (key == "sharcTemporalDebugMode") mSharcTemporalDebugMode = temporalDebugMode;
+        else if (key == "sharcTemporalDebugDepth") mSharcTemporalDebugDepth = temporalDebugDepth;
         else if (key == kSharcPretrainSpp) mSharcPretrainSpp = pretrainSpp;
         else if (key == kTemporalUpdateForDynamicScene)
         {
@@ -583,8 +609,12 @@ Dictionary RTPT::getScriptingDictionary()
     d["enableSHARC"] = mEnableSharc;
     d["sharcFreeze"] = mSharcFreeze;
     d["sharcUseCache"] = mSharcUseCache;
+    d["sharcTemporalUseCache"] = mSharcTemporalUseCache;
     d["sharcGenerateStats"] = mSharcGenerateStats;
     d["sharcDebugMode"] = mSharcDebugMode;
+    d["sharcDebugDepth"] = mSharcDebugDepth;
+    d["sharcTemporalDebugMode"] = mSharcTemporalDebugMode;
+    d["sharcTemporalDebugDepth"] = mSharcTemporalDebugDepth;
     d[kSharcPretrainSpp] = mSharcPretrainSpp;
     d[kTemporalUpdateForDynamicScene] = mStaticParams.temporalUpdateForDynamicScene;
     d[kEnableRayStats] = mEnableRayStats;
@@ -697,6 +727,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
                 {
                     pRenderContext->clearUAV(mpSharcGenerateStats->getUAV().get(), uint4(0));
                     pRenderContext->uavBarrier(mpSharcGenerateStats.get());
+                    if (mpSharcTemporalStats)
+                    {
+                        pRenderContext->clearUAV(mpSharcTemporalStats->getUAV().get(), uint4(0));
+                        pRenderContext->uavBarrier(mpSharcTemporalStats.get());
+                    }
                 }
             }
 
@@ -766,27 +801,28 @@ void RTPT::renderUI(Gui::Widgets& widget)
         if (group.checkbox("Enable SHaRC", mEnableSharc))
         {
             mRecompile = true;
-            if (!mEnableSharc || mEnableTemporalReuse || mEnableSpatialReuse)
+            if (!mEnableSharc || mEnableSpatialReuse)
             {
                 dirty |= mSharcUseCache;
                 mSharcUseCache = false;
                 mSharcDebugMode = 0;
+                mSharcTemporalDebugMode = 0;
             }
         }
         group.var("Scene-load training (spp)", mSharcPretrainSpp);
         group.tooltip("Training paths per pixel from the starting camera. Changes apply on the next scene load or when the cache is enabled again. Zero skips pretraining.");
         if (mEnableSharc)
         {
-            if (!mEnableTemporalReuse && !mEnableSpatialReuse)
+            if (!mEnableSpatialReuse)
             {
-                if (group.checkbox("Use SHaRC in Generate", mSharcUseCache))
+                if (group.checkbox("Use SHaRC in Generate and Temporal", mSharcUseCache))
                 {
                     mRecompile = true;
                     dirty = true;
-                    if (!mSharcUseCache) mSharcDebugMode = 0;
+                    if (!mSharcUseCache) mSharcDebugMode = mSharcTemporalDebugMode = 0;
                 }
             }
-            else group.text("Disable Temporal and Spatial reuse to use SHaRC in Generate.");
+            else group.text("Disable Spatial reuse to query SHaRC.");
             group.checkbox("Freeze cache updates", mSharcFreeze);
             if (group.button("Clear cache")) mSharcNeedsClear = true;
         }
@@ -855,12 +891,10 @@ bool RTPT::renderRenderingUI(Gui::Widgets& widget)
         if (mParams.rejectShiftBasedOnJacobian)
             dirty |= widget.var("Shift rejection jacobian threshold", mParams.jacobianRejectionThreshold, 0.f, 100.f);
         dirty |= widget.var("Specular roughness threshold", mParams.specularRoughnessThreshold, 0.f, 1.f);
-        if (querySharcInGenerate()) widget.text("Disable SHaRC in Generate to use Temporal or Spatial reuse.");
-        else
-        {
-            dirty |= widget.checkbox("Spatial Reuse", mEnableSpatialReuse);
-            dirty |= widget.checkbox("Temporal Reuse", mEnableTemporalReuse);
-        }
+        if (querySharcInGenerate()) widget.text("Disable SHaRC queries to enable Spatial reuse.");
+        else dirty |= widget.checkbox("Spatial Reuse", mEnableSpatialReuse);
+        dirty |= widget.checkbox("Temporal Reuse", mEnableTemporalReuse);
+        if (!mEnableTemporalReuse) mSharcTemporalDebugMode = 0;
 
         if (mEnableSpatialReuse)
         {
@@ -1104,6 +1138,8 @@ void RTPT::updatePrograms()
     specializeSharc(defines);
     mpTracePass->addDefine("SHARC_GENERATE_QUERY", querySharcInGenerate() ? "1" : "0");
     mpTracePass->addDefine("SHARC_GENERATE_STATS", mSharcGenerateStats ? "1" : "0");
+    mpTemporalReusePass->addDefine("SHARC_TEMPORAL_QUERY", querySharcInTemporal() ? "1" : "0");
+    mpTemporalReusePass->addDefine("SHARC_TEMPORAL_STATS", querySharcInTemporal() && mSharcGenerateStats ? "1" : "0");
 
     // Update program specialization. This is done through defines in lieu of specialization constants.
     mpGeneratePaths->getProgram()->addDefines(defines);
@@ -1544,7 +1580,11 @@ void RTPT::tracePass(RenderContext* pRenderContext, const RenderData& renderData
     if (querySharcInGenerate())
     {
         bindSharc(var["CB"]["gSharcQuery"]);
-        if (mSharcGenerateStats) var["CB"]["gSharcDebugMode"] = mSharcDebugMode;
+        if (mSharcGenerateStats)
+        {
+            var["CB"]["gSharcDebugMode"] = mSharcDebugMode;
+            var["CB"]["gSharcDebugDepth"] = mSharcDebugDepth;
+        }
     }
     if (mSharcGenerateStats) var["gSharcGenerateStats"] = mpSharcGenerateStats;
 
@@ -1584,6 +1624,17 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
 
     if (isTemporalReuse)
     {
+        if (querySharcInTemporal())
+        {
+            const auto cb = pass->getRootVar()["TemporalSharcCB"];
+            bindSharc(cb["gSharcTemporalQuery"]);
+            if (mSharcGenerateStats)
+            {
+                cb["gTemporalSharcDebugMode"] = mSharcTemporalDebugMode;
+                cb["gTemporalSharcDebugDepth"] = mSharcTemporalDebugDepth;
+                pass["gSharcTemporalStats"] = mpSharcTemporalStats;
+            }
+        }
         var["temporalVbuffer"] = mpTemporalVBuffer;
         var["motionVectors"] = renderData[kInputMotionVectors]->asTexture();
         var["gEnableTemporalReprojection"] = mEnableTemporalReprojection;

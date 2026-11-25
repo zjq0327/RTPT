@@ -15,9 +15,20 @@ namespace
     constexpr uint32_t kGenerateProbeOffset = kGenerateDepthCount * kGenerateMetricCount;
     constexpr uint32_t kGenerateRayCountOffset = kGenerateProbeOffset + 16;
     constexpr uint32_t kGenerateCounterCount = kGenerateRayCountOffset + kGenerateDepthCount;
+    // Five depth histograms followed by sixteen scalar slots in the Temporal shader.
+    constexpr uint32_t kTemporalCounterCount = 6u * kGenerateDepthCount;
     const char kSharcUpdateFile[] = "RenderPasses/RTPT/SharcUpdate.cs.slang";
     const char kSharcResolveFile[] = "RenderPasses/ReSTIRPTPass/SharcResolve.cs.slang";
     const char kSharcInvalidateFile[] = "RenderPasses/ReSTIRPTPass/SharcInvalidate.cs.slang";
+
+    pybind11::bytes readReservoirs(const Buffer::SharedPtr& reservoirs)
+    {
+        // One tile-padded image of the last sample-per-pixel chain.
+        const auto data = static_cast<const char*>(reservoirs->map(Buffer::MapType::Read));
+        pybind11::bytes result(data, reservoirs->getSize());
+        reservoirs->unmap();
+        return result;
+    }
 }
 
 void RTPT::specializeSharc(const Program::DefineList& defines)
@@ -26,6 +37,12 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
         mpSharcGenerateStats = Buffer::createStructured(sizeof(uint32_t), kGenerateCounterCount,
             Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
     else if (!mSharcGenerateStats) mpSharcGenerateStats.reset();
+
+    const bool collectTemporal = mSharcGenerateStats && querySharcInTemporal();
+    if (collectTemporal && !mpSharcTemporalStats)
+        mpSharcTemporalStats = Buffer::createStructured(sizeof(uint32_t), kTemporalCounterCount,
+            Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
+    else if (!collectTemporal) mpSharcTemporalStats.reset();
 
     if (!mEnableSharc)
     {
@@ -360,9 +377,25 @@ pybind11::bytes RTPT::getSharcFreshReservoirs() const
     if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
     if (mEnableTemporalReuse || mEnableSpatialReuse)
         throw std::logic_error("Fresh reservoir readback requires Temporal and Spatial reuse disabled.");
-    // One tile-padded image of the last sample-per-pixel chain.
-    const auto data = static_cast<const char*>(mpOutputReservoirs->map(Buffer::MapType::Read));
-    pybind11::bytes result(data, mpOutputReservoirs->getSize());
-    mpOutputReservoirs->unmap();
-    return result;
+    return readReservoirs(mpOutputReservoirs);
+}
+
+std::vector<uint32_t> RTPT::getSharcTemporalStats() const
+{
+    std::vector<uint32_t> values(kTemporalCounterCount);
+    if (mSharcGenerateStats && mpSharcTemporalStats)
+    {
+        const auto* data = static_cast<const uint32_t*>(mpSharcTemporalStats->map(Buffer::MapType::Read));
+        std::copy_n(data, values.size(), values.begin());
+        mpSharcTemporalStats->unmap();
+    }
+    return values;
+}
+
+pybind11::bytes RTPT::getSharcTemporalReservoirs() const
+{
+    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
+    if (!mEnableTemporalReuse || mEnableSpatialReuse)
+        throw std::logic_error("Temporal reservoir readback requires Temporal reuse enabled and Spatial reuse disabled.");
+    return readReservoirs(mpOutputReservoirs);
 }

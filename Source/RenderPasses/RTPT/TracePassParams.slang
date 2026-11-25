@@ -23,6 +23,7 @@ cbuffer CB
 #endif
 #if SHARC_GENERATE_QUERY && SHARC_GENERATE_STATS
     uint gSharcDebugMode;
+    uint gSharcDebugDepth;
 #endif
 }
 
@@ -41,7 +42,7 @@ void applySharcDebugMode(uint depth, bool eligible, inout bool hit, inout float3
 {
     if (eligible) countSharc(depth, SharcDepthStat::Eligible);
     if (gSharcDebugMode == 0u) return;
-    hit = eligible && depth == 2u && (gSharcDebugMode == 2u || gSharcDebugMode == 3u);
+    hit = eligible && depth == gSharcDebugDepth && (gSharcDebugMode == 2u || gSharcDebugMode == 3u);
     radiance = gSharcDebugMode == 2u ? float3(8.f, 4.f, 2.f) : float3(0.f);
 }
 

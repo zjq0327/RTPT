@@ -131,6 +131,18 @@ struct ReSTIRPathFlags
     [mutating] void markSharcTerminal() { flags |= 1 << 17; }
     bool isSharcTerminal() { return (flags & (1 << 17)) != 0; }
 
+    // A fixed x1 has exactly two sampled edges. The third bounce count is
+    // implied. Keep the sampled diffuse lobe separate from roughness-based counts.
+    [mutating] void setSharcRoot(uint diffuseBounces, uint specularBounces, bool diffuseLobe, bool primaryCountedDiffuse)
+    {
+        flags = (flags & ~0x30f000) | (int(diffuseBounces) << 12) | (int(specularBounces) << 14) |
+            (int(diffuseLobe) << 20) | (int(primaryCountedDiffuse) << 21);
+    }
+    uint sharcRootDiffuseBounces() { return (flags >> 12) & 3; }
+    uint sharcRootSpecularBounces() { return (flags >> 14) & 3; }
+    bool sharcRootDiffuseLobe() { return (flags & (1 << 20)) != 0; }
+    bool sharcPrimaryCountedDiffuse() { return (flags & (1 << 21)) != 0; }
+
     [mutating]
     void insertLightType(uint lightType)
     {
@@ -194,7 +206,7 @@ struct PathReservoir
     uint rcRandomSeed; // saved random seed after rcVertex (due to the need of blending half-vector reuse and random number replay)
     float3 F = 0.f; // cached integrand (always updated after a new path is chosen in RIS)
     float lightPdf; // NEE light pdf (might change after shift if transmission is included since light sampling considers "upperHemisphere" of the previous bounce)
-    float3 cachedJacobian; // Two scatter PDFs and a geometry term.
+    float3 cachedJacobian; // Two scatter PDFs. z is conditional suffix RR survival for SHaRC, otherwise geometry.
     TriMeshHitInfo rcVertexHit; // hitinfo of the reconnection vertex
     float3 rcVertexWi[kRcAttrCount]; // incident direction on reconnection vertex
     float3 rcVertexIrradiance[kRcAttrCount]; // sampled irradiance on reconnection vertex

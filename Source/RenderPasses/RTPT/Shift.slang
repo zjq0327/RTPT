@@ -15,6 +15,15 @@ import Scene.RaytracingInline;
 import Scene.Scene;
 import PathTracer;
 import RenderPasses.Shared.Denoising.NRDData;
+#ifndef SHARC_TEMPORAL_QUERY
+#define SHARC_TEMPORAL_QUERY 0
+#endif
+#ifndef SHARC_TEMPORAL_STATS
+#define SHARC_TEMPORAL_STATS 0
+#endif
+#if SHARC_TEMPORAL_STATS
+import SharcTemporalParams;
+#endif
 
 ParameterBlock<PathTracer> gPathTracer;
 
@@ -26,7 +35,7 @@ bool isJacobianInvalid(float Jacobian)
 // dstPdf * dstJacobian transforms pdf in dst space to src space
 // srcPdf / dstJacobian transforms pdf in src space to dst space
 float3 computeShiftedIntegrandReconnection(const RestirPathTracerParams params, inout float dstJacobian,  ShadingData dstPrimarySd,
-                                ShadingData srcPrimarySd, inout PathReservoir srcReservoir, bool evalVisibility)
+                                ShadingData srcPrimarySd, inout PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation)
 {
     dstJacobian = 0.f;
 
@@ -51,6 +60,10 @@ float3 computeShiftedIntegrandReconnection(const RestirPathTracerParams params, 
         {
             float3 wi = rcVertexWi;
             bool isVisible = evalSegmentVisibility(dstPrimarySd.posW, wi, true); // test along a direction
+#if SHARC_TEMPORAL_STATS
+            if (reverseEvaluation)
+                countSharcTemporal(isVisible ? SharcTemporalStat::ReverseVisible : SharcTemporalStat::ReverseOccluded);
+#endif
             if (isVisible)
             {
                 float srcPDF1 = evalPdfBSDF(srcPrimarySd, wi);
@@ -172,6 +185,10 @@ float3 computeShiftedIntegrandReconnection(const RestirPathTracerParams params, 
     if (evalVisibility)
     {
         bool isVisible = evalSegmentVisibility(dstPrimarySd.posW, rcVertexSd.posW);
+#if SHARC_TEMPORAL_STATS
+        if (reverseEvaluation)
+            countSharcTemporal(isVisible ? SharcTemporalStat::ReverseVisible : SharcTemporalStat::ReverseOccluded);
+#endif
         if (!isVisible)
             return 0.f;
     }
@@ -194,20 +211,42 @@ float3 computeShiftedIntegrandReconnection(const RestirPathTracerParams params, 
 }
 
 float3 computeShiftedIntegrand(const RestirPathTracerParams params, out float dstJacobian, const ShadingData dstPrimarySd,
-    const ShadingData srcPrimarySd, PathReservoir srcReservoir, bool evalVisibility)
+    const ShadingData srcPrimarySd, PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation = false)
 {
     dstJacobian = 0.f;
     if (srcReservoir.weight == 0.f) return 0.f;
-    return computeShiftedIntegrandReconnection(params, dstJacobian, dstPrimarySd, srcPrimarySd, srcReservoir, evalVisibility);
+#if SHARC_TEMPORAL_QUERY
+    // A black hit or exhausted depth budget cannot win a connection from either primary.
+    if (srcReservoir.pathFlags.isSharcTerminal() && all(srcReservoir.rcVertexIrradiance[0] == 0.f)) return 0.f;
+#endif
+    float3 integrand = computeShiftedIntegrandReconnection(params, dstJacobian, dstPrimarySd, srcPrimarySd, srcReservoir,
+        evalVisibility, reverseEvaluation);
+#if SHARC_TEMPORAL_STATS
+    if (reverseEvaluation)
+    {
+        countSharcTemporal(SharcTemporalStat::ReverseEvaluation);
+        countSharcTemporal(PathReservoir::toScalar(integrand) * dstJacobian > 0.f ?
+            SharcTemporalStat::ReversePositive : SharcTemporalStat::ReverseZero);
+    }
+#endif
+    return integrand;
 }
 
 bool shiftAndMergeReservoir(const RestirPathTracerParams params, bool temporalUpdateForDynamicScene, out float dstJacobian,
     const ShadingData dstPrimarySd, inout PathReservoir dstReservoir, const ShadingData srcPrimarySd, PathReservoir srcReservoir,
     bool evalVisibility, inout SampleGenerator sg, float misWeight = 1.f, bool forceMerge = false)
 {
-    if (srcReservoir.weight != 0.f && temporalUpdateForDynamicScene && kTemporalUpdateForDynamicScene)
-        gPathTracer.traceTemporalUpdate(dstPrimarySd, srcReservoir);
+    const bool replayHistory = temporalUpdateForDynamicScene && srcReservoir.weight != 0.f;
+    float survivalJacobian = 1.f;
+    if (replayHistory)
+        survivalJacobian = gPathTracer.traceTemporalUpdate(dstPrimarySd, srcReservoir);
     float3 dstIntegrand = computeShiftedIntegrand(params, dstJacobian, dstPrimarySd, srcPrimarySd, srcReservoir, evalVisibility);
+    dstJacobian *= survivalJacobian;
+#if SHARC_TEMPORAL_STATS
+    if (replayHistory && srcReservoir.pathFlags.isSharcTerminal())
+        countSharcTemporal(PathReservoir::toScalar(dstIntegrand) * dstJacobian > 0.f ?
+            SharcTemporalStat::ForwardPositive : SharcTemporalStat::ForwardZero);
+#endif
 
     bool selected = dstReservoir.merge(dstIntegrand, dstJacobian, srcReservoir, sg, misWeight, forceMerge);
 
