@@ -53,6 +53,15 @@ struct PathBuilder
     }
 
     [mutating]
+    bool addSharcVertex(uint depth, float3 F, float3 incident, float survivalPdf, inout PathReservoir reservoir)
+    {
+        if (!reservoir.add(F, survivalPdf, sg)) return false;
+        storeEndpoint(depth, false, 0u, 0.f, F, incident, rcVertexWi[0], reservoir);
+        reservoir.pathFlags.markSharcTerminal();
+        return true;
+    }
+
+    [mutating]
     bool addEscapeVertex(RestirPathTracerParams params, uint pathLength, float3 wi, float3 pathWeight, float3 postfixWeight,
         float russianroulettePDF, float misWeight, float lightPdf, int lightType, inout PathReservoir pathReservoir, bool forceAdd = false)
     {

@@ -37,6 +37,15 @@ __exported import Params;
 #ifndef SHARC_TRAINING
 #define SHARC_TRAINING 0
 #endif
+#ifndef SHARC_GENERATE_QUERY
+#define SHARC_GENERATE_QUERY 0
+#endif
+#ifndef SHARC_GENERATE_STATS
+#define SHARC_GENERATE_STATS 0
+#endif
+#if SHARC_GENERATE_QUERY || SHARC_GENERATE_STATS
+import TracePassParams;
+#endif
 
 uint getAllowedBSDFFlags(bool isSpecularBounce)
 {
@@ -335,7 +344,7 @@ struct PathTracer
 #endif
 
             path.clearEventFlags();
-#if SHARC_TRAINING
+#if SHARC_TRAINING || SHARC_GENERATE_QUERY
             path.previousRoughness = sd.linearRoughness;
             path.previousDiffuse = result.isLobe(LobeType::DiffuseReflection);
 #endif
@@ -949,7 +958,7 @@ struct PathTracer
         return loadShadingData(path.hit, -path.dir, path.length == 0, path.length > 0 ? params.lodBias : 0.f);
     }
 
-#if SHARC_TRAINING
+#if SHARC_TRAINING || SHARC_GENERATE_QUERY
     bool allowsSharcDepth(PathState path)
     {
         return path.length >= SHARC_MIN_DEPTH && path.length < kMaximumPathLength &&
@@ -957,33 +966,41 @@ struct PathTracer
     }
 #endif
 
-    /** Handle the case when a scatter ray hits the scene.
-        After handling the hit, a new scatter ray is generated or the path is terminated.
-        \param[in,out] path The path state.
-    */
     void handleHit(inout PathState path)
     {
-        // Upon hit:
-        // - Load vertex/material data
-        // - Compute volume absorption
-        // - Compute MIS weight if path.length > 0 and emissive hit
-        // - Add emitted radiance
-        // - Sample light(s) using shadow rays
-        // - Sample scatter ray or terminate
-
-        TriangleHit th = path.hit.getTriangleHit();
-
-        bool isCurveHit = path.hit.getType() == HitType::Curve;
-
-        // Load vertex/material attributes. This is a long latency operation.
         ShadingData sd = loadPathSurface(path);
-
-        // Reject false hits in nested dielectrics.
-
         if (handleHomogeneousVolumeExtinction(path, sd)) return;
-
         if (!handleNestedDielectrics(sd, path)) return;
 
+#if SHARC_GENERATE_STATS
+        if (path.length >= SHARC_MIN_DEPTH) countSharc(path.length, SharcDepthStat::Arrived);
+#endif
+#if SHARC_GENERATE_QUERY
+        if (allowsSharcDepth(path))
+        {
+            float3 radiance;
+            bool eligible;
+            bool hit = gSharcQuery.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, radiance, eligible);
+#if SHARC_GENERATE_STATS
+            applySharcDebugMode(path.length, eligible, hit, radiance);
+#endif
+            if (hit)
+            {
+                float3 F = path.getCurrentThp() * radiance;
+                float3 incident = path.thp * radiance;
+                bool selected = path.pathBuilder.addSharcVertex(path.length, F, incident, path.russianRoulettePdf, path.pathReservoir);
+#if SHARC_GENERATE_STATS
+                recordSharcHit(path, F, radiance, selected);
+#endif
+                // Cached radiance covers the remaining path even if an earlier Fresh event wins.
+                path.terminate();
+                return;
+            }
+        }
+#endif
+#if SHARC_GENERATE_STATS
+        if (path.length >= SHARC_MIN_DEPTH) countSharc(path.length, SharcDepthStat::Explicit);
+#endif
 
         logPathVertex();
 

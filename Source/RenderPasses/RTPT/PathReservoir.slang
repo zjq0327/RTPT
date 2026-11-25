@@ -128,6 +128,9 @@ struct ReSTIRPathFlags
         return (flags >> 16) & 1;
     }
 
+    [mutating] void markSharcTerminal() { flags |= 1 << 17; }
+    bool isSharcTerminal() { return (flags & (1 << 17)) != 0; }
+
     [mutating]
     void insertLightType(uint lightType)
     {

@@ -90,10 +90,11 @@ struct SharcQueryData
     }
 
     bool lookup(ShadingData sd, float3 previousPosition, bool previousDelta, bool previousDiffuse,
-        float previousRoughness, out float3 radiance)
+        float previousRoughness, out float3 radiance, out bool eligible)
     {
         radiance = 0.f;
-        if (!allowsSurface(sd, previousPosition, previousDelta, previousDiffuse, previousRoughness)) return false;
+        eligible = allowsSurface(sd, previousPosition, previousDelta, previousDiffuse, previousRoughness);
+        if (!eligible) return false;
 #if SHARC_STATS
         InterlockedAdd(stats[0], 1u);
 #endif
@@ -103,7 +104,15 @@ struct SharcQueryData
 #if SHARC_STATS
         InterlockedAdd(stats[1], 1u);
 #endif
+        // A sufficiently sampled black voxel still terminates the path.
         radiance = value;
         return true;
+    }
+
+    bool lookup(ShadingData sd, float3 previousPosition, bool previousDelta, bool previousDiffuse,
+        float previousRoughness, out float3 radiance)
+    {
+        bool eligible;
+        return lookup(sd, previousPosition, previousDelta, previousDiffuse, previousRoughness, radiance, eligible);
     }
 };

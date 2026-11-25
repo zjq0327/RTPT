@@ -10,12 +10,13 @@ import RenderPasses.Shared.Denoising.NRDBuffers;
 import Params;
 import PathReservoir;
 
-ParameterBlock<PathTracer> gPathTracer;
+import TracePassParams;
 
-cbuffer CB
-{
-    int gSampleId;
-}
+#ifndef SHARC_GENERATE_STATS
+#define SHARC_GENERATE_STATS 0
+#endif
+
+ParameterBlock<PathTracer> gPathTracer;
 
 void tracePath(uint pathID, inout PathReservoir giReservoir, uint sampleIdx)
 {
@@ -31,6 +32,9 @@ void tracePath(uint pathID, inout PathReservoir giReservoir, uint sampleIdx)
         {
             gPathTracer.handleHit(path);
             if (path.isTerminated()) break;
+#if SHARC_GENERATE_STATS
+            if (path.length >= 1u) InterlockedAdd(gSharcGenerateStats[144u + min(path.length, 15u)], 1u);
+#endif
             gPathTracer.nextVertex(path);
         }
         else
@@ -41,6 +45,13 @@ void tracePath(uint pathID, inout PathReservoir giReservoir, uint sampleIdx)
 
     gPathTracer.finalize(path);
     gPathTracer.writeOutput(path, giReservoir, sampleIdx);
+#if SHARC_GENERATE_STATS
+    if (sampleIdx == kCandidateSamples - 1)
+    {
+        PathReservoir fresh = gPathTracer.outputReservoirs[gPathTracer.params.getReservoirOffset(path.getPixel())];
+        if (fresh.weight > 0.f && fresh.pathFlags.isSharcTerminal()) countSharc(fresh.pathFlags.pathLength(), SharcDepthStat::Winners);
+    }
+#endif
 }
 
 [numthreads(16, 16, 1)]

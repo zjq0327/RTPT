@@ -11,6 +11,9 @@ import Rendering.Materials.InteriorListHelpers;
 #ifndef SHARC_TRAINING
 #define SHARC_TRAINING 0
 #endif
+#ifndef SHARC_GENERATE_QUERY
+#define SHARC_GENERATE_QUERY 0
+#endif
 
 static const uint kMaxRejectedHits = 16; // Maximum number of rejected hits along a path. The path is terminated if the limit is reached to avoid getting stuck in pathological cases.
 
@@ -90,7 +93,7 @@ struct PathState
 
     float      russianRoulettePdf = 1.f;
     float      prevScatterPdf = 1.f;
-#if SHARC_TRAINING
+#if SHARC_TRAINING || SHARC_GENERATE_QUERY
     float previousRoughness;
     bool previousDiffuse;
 #endif

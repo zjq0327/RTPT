@@ -59,7 +59,12 @@ private:
     void bindSharc(const ShaderVar& var) const;
     void trackSharcMotion(bool lightingChanged);
     void updateSharc(RenderContext* pRenderContext);
+    void traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride);
+    void resolveSharcTraining(RenderContext* pRenderContext);
     pybind11::dict getSharcStats() const;
+    pybind11::dict getSharcGenerateStats() const;
+    pybind11::bytes getSharcFreshReservoirs() const;
+    bool querySharcInGenerate() const { return mEnableSharc && mSharcUseCache; }
     void prepareMaterials(RenderContext* pRenderContext);
     bool prepareLighting(RenderContext* pRenderContext);
     void setShaderData(const ShaderVar& var, const RenderData& renderData, bool isPathTracer, bool isPathGenerator) const;
@@ -170,7 +175,15 @@ private:
 
     bool                            mEnableSharc = false;
     bool                            mSharcFreeze = false;
+    bool                            mSharcUseCache = false;
+    bool                            mSharcGenerateStats = false;
+    uint32_t                        mSharcDebugMode = 0;
+    Buffer::SharedPtr               mpSharcGenerateStats;
     bool                            mSharcNeedsClear = true;
+    bool                            mSharcPretrainPending = true;
+    static constexpr uint32_t       kDefaultSharcPretrainSpp = 8;
+    uint32_t                        mSharcPretrainSpp = kDefaultSharcPretrainSpp;
+    uint32_t                        mSharcPretrainedSpp = 0;
     uint32_t                        mSharcFrameIndex = 0;
     uint64_t                        mSharcUpdateCount = 0, mSharcResolveCount = 0;
     uint64_t                        mSharcClearCount = 0, mSharcInvalidateCount = 0;

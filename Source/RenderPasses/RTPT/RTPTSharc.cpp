@@ -2,11 +2,19 @@
  # Copyright (c) 2022, Daqi Lin. All rights reserved.
  **************************************************************************/
 #include "RTPT.h"
+#include <array>
+#include <cstring>
 
 namespace
 {
     constexpr uint32_t kSharcCapacity = 1u << 20;
     constexpr uint32_t kSharcUpdateStride = 5;
+    constexpr uint32_t kSharcPretrainBatchSpp = 8;
+    constexpr uint32_t kGenerateDepthCount = 16;
+    constexpr uint32_t kGenerateMetricCount = 8;
+    constexpr uint32_t kGenerateProbeOffset = kGenerateDepthCount * kGenerateMetricCount;
+    constexpr uint32_t kGenerateRayCountOffset = kGenerateProbeOffset + 16;
+    constexpr uint32_t kGenerateCounterCount = kGenerateRayCountOffset + kGenerateDepthCount;
     const char kSharcUpdateFile[] = "RenderPasses/RTPT/SharcUpdate.cs.slang";
     const char kSharcResolveFile[] = "RenderPasses/ReSTIRPTPass/SharcResolve.cs.slang";
     const char kSharcInvalidateFile[] = "RenderPasses/ReSTIRPTPass/SharcInvalidate.cs.slang";
@@ -14,6 +22,11 @@ namespace
 
 void RTPT::specializeSharc(const Program::DefineList& defines)
 {
+    if (mSharcGenerateStats && !mpSharcGenerateStats)
+        mpSharcGenerateStats = Buffer::createStructured(sizeof(uint32_t), kGenerateCounterCount,
+            Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
+    else if (!mSharcGenerateStats) mpSharcGenerateStats.reset();
+
     if (!mEnableSharc)
     {
         mpSharcUpdate.reset();
@@ -24,11 +37,12 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
         mSharcPreviousBounds.clear();
         mSharcMotionBounds.clear();
         mSharcNeedsClear = true;
+        mSharcPretrainPending = true;
+        mSharcPretrainedSpp = 0;
         return;
     }
     auto updateDefines = defines;
     updateDefines.add("SHARC_TRAINING", "1");
-    updateDefines.add("SHARC_MIN_DEPTH", "3");
     updateDefines.add(mpScene->getSceneDefines());
     if (mpEmissiveSampler) updateDefines.add(mpEmissiveSampler->getDefines());
     if (!mpSharcUpdate)
@@ -79,7 +93,7 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         mpSharcResolved = Buffer::createStructured(16u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
         mSharcNeedsClear = true;
     }
-    if (mSharcFreeze && !mSharcNeedsClear && mSharcMotionBounds.empty()) return;
+    if (mSharcFreeze && !mSharcPretrainPending && !mSharcNeedsClear && mSharcMotionBounds.empty()) return;
     // Invalidation uses world-space keys. A frozen grid keeps its last resolved camera/LOD.
     if (mSharcNeedsClear || !mSharcFreeze) mSharcPublishedGrid.cameraPosition = mpScene->getCamera()->getPosition();
     const auto buffers = {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved};
@@ -120,6 +134,27 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         pRenderContext->uavBarrier(mpSharcAccumulation.get());
         pRenderContext->uavBarrier(mpSharcResolved.get());
     }
+    if (mSharcPretrainPending)
+    {
+        // The upstream V-buffer has the scene's initial pose. Only the training RNG advances.
+        while (mSharcPretrainedSpp < mSharcPretrainSpp)
+        {
+            {
+                PROFILE("SHaRC Pretrain");
+                const uint32_t batch = std::min(mSharcPretrainSpp - mSharcPretrainedSpp, kSharcPretrainBatchSpp);
+                for (uint32_t i = 0; i < batch; ++i)
+                {
+                    traceSharcTrainingPaths(pRenderContext, 1u);
+                    resolveSharcTraining(pRenderContext);
+                    ++mSharcPretrainedSpp;
+                }
+            }
+            // Bound outstanding GPU work and transient allocations for long pretrains.
+            if (mSharcPretrainedSpp < mSharcPretrainSpp) pRenderContext->flush(true);
+        }
+        mSharcPretrainPending = false;
+        if (mSharcPretrainedSpp > 0) return;
+    }
     if (mSharcFreeze)
     {
         ++mSharcPublishedVersion;
@@ -127,32 +162,44 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
     }
     {
         PROFILE("SHaRC SparseUpdate");
-        ++mSharcUpdateCount;
-        auto var = mpSharcUpdate->getRootVar();
-        mpScene->setRaytracingShaderData(pRenderContext, var);
-        mpSampleGenerator->setShaderData(var);
-        var["gPathTracer"] = mpPathTracerBlock;
-        auto cb = var["CB"];
-        bindSharc(cb["gSharcWrite"]);
-        cb["gSharcFrameIndex"] = mSharcFrameIndex;
-        cb["gUpdateStride"] = kSharcUpdateStride;
-        mpSharcUpdate->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(kSharcUpdateStride)), 1u));
-        for (const auto& buffer : buffers) pRenderContext->uavBarrier(buffer.get());
+        traceSharcTrainingPaths(pRenderContext, kSharcUpdateStride);
     }
     {
         PROFILE("SHaRC Resolve");
-        ++mSharcResolveCount;
-        auto cb = mpSharcResolve->getRootVar()["PerFrame"];
-        bindSharc(cb["gSharc"]);
-        auto resolve = cb["gResolve"];
-        resolve["cameraPositionPrev"] = mSharcPreviousCamera;
-        resolve["accumulationFrameNum"] = 32u;
-        resolve["responsiveFrameNum"] = 1u;
-        resolve["staleFrameNumMax"] = 128u;
-        resolve["frameIndex"] = mSharcFrameIndex;
-        mpSharcResolve->execute(pRenderContext, uint3(kSharcCapacity, 1u, 1u));
-        for (const auto& buffer : buffers) pRenderContext->uavBarrier(buffer.get());
+        resolveSharcTraining(pRenderContext);
     }
+}
+
+void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride)
+{
+    ++mSharcUpdateCount;
+    auto var = mpSharcUpdate->getRootVar();
+    mpScene->setRaytracingShaderData(pRenderContext, var);
+    mpSampleGenerator->setShaderData(var);
+    var["gPathTracer"] = mpPathTracerBlock;
+    auto cb = var["CB"];
+    bindSharc(cb["gSharcWrite"]);
+    cb["gSharcFrameIndex"] = mSharcFrameIndex;
+    cb["gUpdateStride"] = stride;
+    mpSharcUpdate->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(stride)), 1u));
+    for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
+        pRenderContext->uavBarrier(buffer.get());
+}
+
+void RTPT::resolveSharcTraining(RenderContext* pRenderContext)
+{
+    ++mSharcResolveCount;
+    auto cb = mpSharcResolve->getRootVar()["PerFrame"];
+    bindSharc(cb["gSharc"]);
+    auto resolve = cb["gResolve"];
+    resolve["cameraPositionPrev"] = mSharcPreviousCamera;
+    resolve["accumulationFrameNum"] = 32u;
+    resolve["responsiveFrameNum"] = 1u;
+    resolve["staleFrameNumMax"] = 128u;
+    resolve["frameIndex"] = mSharcFrameIndex;
+    mpSharcResolve->execute(pRenderContext, uint3(kSharcCapacity, 1u, 1u));
+    for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
+        pRenderContext->uavBarrier(buffer.get());
     mSharcPreviousCamera = mpScene->getCamera()->getPosition();
     ++mSharcFrameIndex;
     ++mSharcPublishedVersion;
@@ -258,9 +305,64 @@ pybind11::dict RTPT::getSharcStats() const
     stats["logarithmBase"] = mSharcPublishedGrid.logarithmBase;
     stats["levelBias"] = mSharcPublishedGrid.levelBias;
     stats["updates"] = mSharcUpdateCount;
+    stats["pretrainedSpp"] = mSharcPretrainedSpp;
     stats["resolves"] = mSharcResolveCount;
     stats["clears"] = mSharcClearCount;
     stats["invalidations"] = mSharcInvalidateCount;
     stats["lastMotionBounds"] = mSharcMotionBounds.size() / 2;
     return stats;
+}
+
+pybind11::dict RTPT::getSharcGenerateStats() const
+{
+    // Read only when requested by a diagnostic client. Counter storage is cleared once each rendered frame.
+    std::array<uint32_t, kGenerateCounterCount> values{};
+    if (mSharcGenerateStats && mpSharcGenerateStats)
+    {
+        auto data = static_cast<const uint32_t*>(mpSharcGenerateStats->map(Buffer::MapType::Read));
+        std::copy_n(data, values.size(), values.begin());
+        mpSharcGenerateStats->unmap();
+    }
+    pybind11::dict result;
+    const char* names[kGenerateMetricCount] = {"arrived", "eligible", "hits", "positive", "selected", "winners", "black", "explicit"};
+    for (uint32_t metric = 0; metric < kGenerateMetricCount; ++metric)
+    {
+        std::vector<uint32_t> depths(kGenerateDepthCount);
+        for (uint32_t depth = 0; depth < kGenerateDepthCount; ++depth)
+            depths[depth] = values[depth * kGenerateMetricCount + metric];
+        result[names[metric]] = depths;
+    }
+    result["suffixRays"] = std::vector<uint32_t>(values.begin() + kGenerateRayCountOffset, values.end());
+    result["probe"] = pybind11::none();
+    if (values[kGenerateProbeOffset])
+    {
+        const auto* probe = values.data() + kGenerateProbeOffset;
+        auto vectorAt = [&](uint32_t index)
+        {
+            float rgb[3];
+            std::memcpy(rgb, probe + index, sizeof(rgb));
+            return pybind11::make_tuple(rgb[0], rgb[1], rgb[2]);
+        };
+        pybind11::dict sample;
+        sample["pixel"] = pybind11::make_tuple(probe[1], probe[2]);
+        sample["fullThroughput"] = vectorAt(3);
+        sample["suffixThroughput"] = vectorAt(6);
+        sample["radiance"] = vectorAt(9);
+        sample["wi"] = vectorAt(12);
+        sample["seed"] = probe[15];
+        result["probe"] = sample;
+    }
+    return result;
+}
+
+pybind11::bytes RTPT::getSharcFreshReservoirs() const
+{
+    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
+    if (mEnableTemporalReuse || mEnableSpatialReuse)
+        throw std::logic_error("Fresh reservoir readback requires Temporal and Spatial reuse disabled.");
+    // One tile-padded image of the last sample-per-pixel chain.
+    const auto data = static_cast<const char*>(mpOutputReservoirs->map(Buffer::MapType::Read));
+    pybind11::bytes result(data, mpOutputReservoirs->getSize());
+    mpOutputReservoirs->unmap();
+    return result;
 }
