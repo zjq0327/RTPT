@@ -19,6 +19,10 @@ import RenderPasses.Shared.Denoising.NRDBuffers;
 import RenderPasses.Shared.Denoising.NRDConstants;
 import NRDHelpers;
 
+#ifndef PG_SPATIAL_STATS
+#define PG_SPATIAL_STATS 0
+#endif
+
 struct PathReusePass
 {
     static const uint kNeighborOffsetCount = NEIGHBOR_OFFSET_COUNT;
@@ -226,6 +230,7 @@ struct PathReusePass
         {
             int validNeighborCount = 0;
             float canonicalWeight = 1;
+            float4 centralPGMass = -1.f; // Shared by this pixel's pairwise shifts.
 
             for (int i = 0; i < neighborCount; ++i)
             {
@@ -248,8 +253,9 @@ struct PathReusePass
 
                 float prefixJacobian;
 
-                float3 prefixIntegrand = computeShiftedIntegrand(params, prefixJacobian, neighborPrimarySd,
-                    centralPrimarySd, centralReservoir, true);
+                float4 neighborPGMass = -1.f; // Shared only by the two shifts for this neighbor.
+                float3 prefixIntegrand = computeShiftedIntegrand(neighborPGMass, centralPGMass, params, prefixJacobian, neighborPrimarySd,
+                    centralPrimarySd, centralReservoir, true, true);
 
                 prefix_approxPdf = PathReservoir::computeWeight(prefixIntegrand) * prefixJacobian;
 
@@ -259,7 +265,7 @@ struct PathReusePass
 
                 PathReservoir tempDstReservoir = dstReservoir;
 
-                bool possibleToBeSelected = shiftAndMergeReservoir(params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
+                bool possibleToBeSelected = shiftAndMergeReservoir(centralPGMass, neighborPGMass, params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
                     neighborPrimarySd, neighborReservoir, true, sg, 1.f, true); // "true" means hypothetically selected as the sample
 
                 float neighborWeight = 0.f;
@@ -274,13 +280,19 @@ struct PathReusePass
                 mergeReservoirWithResamplingMIS(params, tempDstReservoir.F, dstJacobian, dstReservoir, tempDstReservoir, neighborReservoir, sg, true, neighborWeight);
             }
 
-            mergeReservoirWithResamplingMIS(params, centralReservoir.F, 1.f, dstReservoir, centralReservoir, centralReservoir, sg, true, canonicalWeight);
+            bool selectedCenter = mergeReservoirWithResamplingMIS(params, centralReservoir.F, 1.f,
+                dstReservoir, centralReservoir, centralReservoir, sg, true, canonicalWeight);
 
             if (dstReservoir.weight > 0)
             {
                 dstReservoir.finalizeGRIS();
                 dstReservoir.weight /= (validNeighborCount + 1); // compensate for the fact that pairwise resampling MIS was not divided by (k+1)
             }
+#if PG_SPATIAL_STATS
+            if (validNeighborCount > 0) InterlockedAdd(pgSpatialCounts[6], uint(validNeighborCount));
+            if (!selectedCenter && dstReservoir.weight > 0.f && isfinite(dstReservoir.weight))
+                InterlockedAdd(pgSpatialCounts[7], 1u);
+#endif
             color = dstReservoir.F * dstReservoir.weight;
         }
         /////////////////////

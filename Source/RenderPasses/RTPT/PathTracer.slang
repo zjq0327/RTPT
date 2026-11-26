@@ -52,7 +52,11 @@ __exported import Params;
 #ifndef PG_GENERATE_GUIDING
 #define PG_GENERATE_GUIDING 0
 #endif
-#if PG_GENERATE_GUIDING
+#ifndef PG_TEMPORAL_GUIDING
+#define PG_TEMPORAL_GUIDING 0
+#endif
+#define PG_SCATTER_GUIDING (PG_GENERATE_GUIDING || PG_TEMPORAL_GUIDING)
+#if PG_SCATTER_GUIDING
 import PGDiffuse;
 #endif
 #if SHARC_GENERATE_QUERY || SHARC_GENERATE_STATS
@@ -311,7 +315,7 @@ struct PathTracer
 
         if (kUseBSDFSampling)
         {
-#if PG_GENERATE_GUIDING
+#if PG_SCATTER_GUIDING
             valid = sampleWithDiffusePG(sd, path.sg, pgMass, !kSeparatePathBSDF, result);
 #else
             valid = sampleBSDF(sd, path.sg, result, !kSeparatePathBSDF);
@@ -474,8 +478,11 @@ struct PathTracer
 
                 if (kUseBSDFSampling)
                 {
-                    // this is single pdf
+#if PG_TEMPORAL_GUIDING
+                    result.pdf = evalPdfWithDiffusePG(sd, result.wi, lookupDiffusePG(sd), pdfAll, allowedBSDFFlags);
+#else
                     result.pdf = evalPdfBSDF(sd, result.wi, pdfAll, allowedBSDFFlags, false);
+#endif
                 }
                 else
                 {
@@ -956,7 +963,11 @@ struct PathTracer
 
         if (all(dir == 0.f))
         {
+#if PG_TEMPORAL_GUIDING
+            valid = generateScatterRay(sd, path, lookupDiffusePG(sd));
+#else
             valid = generateScatterRay(sd, path);
+#endif
         }
         else // generate with given direction
         {
@@ -1150,7 +1161,7 @@ struct PathTracer
         // The available lobes depend on the material.
         uint lobes = getBSDFLobes(sd);
 
-#if PG_GENERATE_GUIDING
+#if PG_SCATTER_GUIDING
         float4 pgMass = lookupDiffusePG(sd);
 #else
         const float4 pgMass = 0.f;
@@ -1243,7 +1254,7 @@ struct PathTracer
 
                     if (kUseMIS && ls.lightType != (uint)LightSampleType::Analytic)
                     {
-#if PG_GENERATE_GUIDING
+#if PG_SCATTER_GUIDING
                         scatterPdf = evalScatterPdfWithDiffusePG(sd, ls.dir, pgMass);
 #else
                         scatterPdf = evalPdfBSDF(sd, ls.dir);
@@ -1518,7 +1529,16 @@ struct PathTracer
 #endif
 
             int rcVertexLength = tempPathReservoir.pathFlags.rcVertexLength();
-            ShadingData rcVertexSd = loadShadingDataWithPrevVertexPosition(tempPathReservoir.rcVertexHit.getHitInfo(), rcPrevSd.posW, false);
+            float3 previousPosition = rcPrevSd.posW;
+            float rcLod = 0.f;
+#if PG_TEMPORAL_GUIDING
+            if (pgDiffuseFraction > 0.f)
+            {
+                previousPosition = rcPrevSd.computeNewRayOrigin(!tempPathReservoir.pathFlags.decodeIsTransmissionEvent(true));
+                rcLod = params.lodBias;
+            }
+#endif
+            ShadingData rcVertexSd = loadShadingDataWithPrevVertexPosition(tempPathReservoir.rcVertexHit.getHitInfo(), previousPosition, false, rcLod);
 
             //rcVertex is NEE
             if (tempPathReservoir.pathFlags.lastVertexNEE() && tempPathReservoir.pathFlags.pathLength() == rcVertexLength)

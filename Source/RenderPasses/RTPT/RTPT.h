@@ -16,6 +16,7 @@
 #include "Rendering/Materials/TexLODTypes.slang"
 #include "Params.slang"
 #include <fstream>
+#include <optional>
 
 using namespace Falcor;
 
@@ -64,8 +65,11 @@ private:
     void preparePG(RenderContext* pRenderContext);
     void releasePG();
     void bindPGTraining(const ShaderVar& var) const;
-    void bindPGRead(const ShaderVar& var, bool previousFrame) const;
+    void bindCurrentPGSampling(const ShaderVar& var) const;
+    bool supportsPGReuse() const;
     bool usePGGenerateShader() const;
+    bool usePGTemporalShader() const;
+    bool usePGSpatialShader() const;
     void barrierPGTraining(RenderContext* pRenderContext) const;
     void notePGTraining(uint32_t stride, bool pretrain);
     void finishPGTraining(RenderContext* pRenderContext, bool immediate);
@@ -226,8 +230,16 @@ private:
     static constexpr float          kDefaultPGDiffuseFraction = 0.5f;
     float                           mPGDiffuseFraction = kDefaultPGDiffuseFraction;
     bool                            mPGGenerateStats = false;
+    bool                            mPGTemporalStats = false;
+    bool                            mPGSpatialStats = false;
+    bool                            mPGSpatialCachePrimary = true;
     static constexpr uint32_t       kPGGenerateCounterCount = 6;
-    Buffer::SharedPtr               mpPGGenerateCounts;
+    static constexpr uint32_t       kPGTemporalCounterCount = 8;
+    static constexpr uint32_t       kPGSpatialCounterCount = 10;
+    Buffer::SharedPtr               mpPGGenerateCounts, mpPGTemporalCounts, mpPGTemporalReplayCounts;
+    Buffer::SharedPtr               mpPGSpatialCounts;
+    std::optional<uint64_t>         mPGGenerateBoundVersion, mPGTemporalBoundVersion;
+    std::vector<uint64_t>           mPGSpatialBoundVersions;
     ComputePass::SharedPtr          mpSharcPGUpdate, mpPGPublish;
     Buffer::SharedPtr               mpPGBuildKeys, mpPGAccumulation, mpPGCounts, mpPGDiagnostics;
     Buffer::SharedPtr               mpPGHistoryMean, mpPGHistoryCount;

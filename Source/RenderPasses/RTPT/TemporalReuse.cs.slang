@@ -227,6 +227,9 @@ struct PathReusePass
 
                     const bool selected = mergeReservoirWithResamplingMIS(params, tempDstReservoir.F, dstJacobian,
                         dstReservoir, tempDstReservoir, neighborReservoir, sg, false, misWeight);
+#if PG_TEMPORAL_STATS
+                    if (i == prevSampleId && selected) InterlockedAdd(pgTemporalCounts[7], 1u);
+#endif
 #if SHARC_TEMPORAL_STATS
                     // History is the final candidate, so acceptance here is the published winner.
                     if (doTemporalUpdateForDynamicScene && i == prevSampleId && selected && dstReservoir.pathFlags.isSharcTerminal())

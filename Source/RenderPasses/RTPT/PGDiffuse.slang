@@ -1,12 +1,21 @@
 import PGModel;
 import Rendering.Materials.MaterialShading;
 
+#ifndef PG_GENERATE_STATS
+#define PG_GENERATE_STATS 0
+#endif
+#ifndef PG_TEMPORAL_STATS
+#define PG_TEMPORAL_STATS 0
+#endif
+
 cbuffer PGGenerateCB
 {
     PGRead pgRead;
     float pgDiffuseFraction;
 #if PG_GENERATE_STATS
     RWStructuredBuffer<uint> pgGenerateCounts;
+#elif PG_TEMPORAL_STATS
+    RWStructuredBuffer<uint> pgTemporalReplayCounts;
 #endif
 }
 
@@ -15,25 +24,39 @@ float3 pgOrientedNormal(ShadingData sd)
     return sd.frontFacing ? sd.faceN : -sd.faceN;
 }
 
-float4 lookupDiffusePG(ShadingData sd)
+float4 lookupDiffusePG(ShadingData sd, out bool requestedGrid)
 {
+    requestedGrid = false;
     if ((sd.getActiveLobes() & uint(LobeType::DiffuseReflection)) == 0u ||
         !any(sd.diffuse > 0.f) || sd.metallic >= 1.f ||
         sd.specularTransmission >= 1.f || sd.diffuseTransmission >= 1.f) return 0.f;
+    requestedGrid = true;
     float4 mass;
     if (!pgLookup(pgRead, sd.posW, pgOrientedNormal(sd), mass) ||
         !all(isfinite(mass)) || any(mass < 0.f) || abs(dot(mass, float4(1.f)) - 1.f) > 1e-4f) return 0.f;
     return mass;
 }
 
+float4 lookupDiffusePG(ShadingData sd)
+{
+    bool ignored;
+    return lookupDiffusePG(sd, ignored);
+}
+
 // A PG draw outside the diffuse shading hemisphere terminates with zero weight.
 // Other lobes and NEE must also omit that failed proposal from their competing density.
-float evalJointDiffusePGPdf(FalcorBSDF bsdf, ShadingData sd, float3 direction, float4 mass, out float nativeJoint)
+float evalJointDiffusePGPdf(FalcorBSDF bsdf, ShadingData sd, float3 direction, float3 woLocal, float3 wiLocal,
+    float4 mass, out float nativeJoint)
 {
-    nativeJoint = bsdf.pDiffuseReflection * bsdf.diffuseReflection.evalPdf(sd.toLocal(sd.V), sd.toLocal(direction));
+    nativeJoint = bsdf.pDiffuseReflection * bsdf.diffuseReflection.evalPdf(woLocal, wiLocal);
     if (!(nativeJoint > 0.f)) return 0.f;
     float guideJoint = bsdf.pDiffuseReflection * pgPdf(mass, pgOrientedNormal(sd), direction);
     return (1.f - pgDiffuseFraction) * nativeJoint + pgDiffuseFraction * guideJoint;
+}
+
+float evalJointDiffusePGPdf(FalcorBSDF bsdf, ShadingData sd, float3 direction, float4 mass, out float nativeJoint)
+{
+    return evalJointDiffusePGPdf(bsdf, sd, direction, sd.toLocal(sd.V), sd.toLocal(direction), mass, nativeJoint);
 }
 
 float evalOtherLobesPdf(FalcorBSDF bsdf, ShadingData sd, float3 direction)
@@ -48,6 +71,33 @@ float evalScatterPdfWithDiffusePG(ShadingData sd, float3 direction, float4 mass)
     bsdf.setup(sd);
     float nativeJoint;
     return evalJointDiffusePGPdf(bsdf, sd, direction, mass, nativeJoint) + evalOtherLobesPdf(bsdf, sd, direction);
+}
+
+// Directional reuse keeps the saved lobe class. Its density includes the
+// probability of drawing that class; light MIS competes with all lobes.
+float evalPdfWithDiffusePG(FalcorBSDF bsdf, ShadingData sd, float3 direction, float3 woLocal, float3 wiLocal,
+    float4 mass, out float pdfAll, uint allowedSampledFlags, bool allowDeltaEval = false)
+{
+    if (allowDeltaEval || pgDiffuseFraction == 0.f || !any(mass > 0.f))
+        return bsdf.evalPdfAll(woLocal, wiLocal, pdfAll, allowedSampledFlags, allowDeltaEval);
+
+    float nativeJoint;
+    float diffuseJoint = evalJointDiffusePGPdf(bsdf, sd, direction, woLocal, wiLocal, mass, nativeJoint);
+    // Strip the native diffuse PDF on a local copy so BSDF evaluation keeps the diffuse lobe.
+    FalcorBSDF pdfBSDF = bsdf;
+    pdfBSDF.pDiffuseReflection = 0.f;
+    float allowed = pdfBSDF.evalPdfAll(woLocal, wiLocal, pdfAll, allowedSampledFlags);
+    pdfAll += diffuseJoint;
+    return allowed + ((allowedSampledFlags & uint(SampledBSDFFlags::DiffuseReflection)) ? diffuseJoint : 0.f);
+}
+
+float evalPdfWithDiffusePG(ShadingData sd, float3 direction, float4 mass, out float pdfAll,
+    uint allowedSampledFlags, bool allowDeltaEval = false)
+{
+    FalcorBSDF bsdf;
+    bsdf.setup(sd);
+    return evalPdfWithDiffusePG(bsdf, sd, direction, sd.toLocal(sd.V), sd.toLocal(direction), mass, pdfAll,
+        allowedSampledFlags, allowDeltaEval);
 }
 
 bool sampleWithDiffusePG<S : ISampleGenerator>(ShadingData sd, inout S sg, float4 mass,
@@ -76,15 +126,21 @@ bool sampleWithDiffusePG<S : ISampleGenerator>(ShadingData sd, inout S sg, float
     else valid = sampleBSDF(sd, sg, result, evaluateAllLobes);
 
     bool diffuse = result.isLobe(LobeType::DiffuseReflection) && bsdf.pDiffuseReflection > 0.f;
+#if PG_GENERATE_STATS || PG_TEMPORAL_STATS
 #if PG_GENERATE_STATS
+#define PG_DRAW_COUNTS pgGenerateCounts
+#else
+#define PG_DRAW_COUNTS pgTemporalReplayCounts
+#endif
     if (diffuse)
     {
-        InterlockedAdd(pgGenerateCounts[0], 1u);
-        if (ready) InterlockedAdd(pgGenerateCounts[1], 1u);
+        InterlockedAdd(PG_DRAW_COUNTS[0], 1u);
+        if (ready) InterlockedAdd(PG_DRAW_COUNTS[1], 1u);
     }
-    if (usedGuide) InterlockedAdd(pgGenerateCounts[diffuse ? 2u : 3u], 1u);
-    else if (result.isLobe(LobeType::SpecularOrDelta)) InterlockedAdd(pgGenerateCounts[4], 1u);
-    else if (diffuse) InterlockedAdd(pgGenerateCounts[5], 1u);
+    if (usedGuide) InterlockedAdd(PG_DRAW_COUNTS[diffuse ? 2u : 3u], 1u);
+    else if (result.isLobe(LobeType::SpecularOrDelta)) InterlockedAdd(PG_DRAW_COUNTS[4], 1u);
+    else if (diffuse) InterlockedAdd(PG_DRAW_COUNTS[5], 1u);
+#undef PG_DRAW_COUNTS
 #endif
     if (!valid || !ready || pgDiffuseFraction == 0.f || result.isLobe(LobeType::Delta)) return valid;
 

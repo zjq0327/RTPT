@@ -20,10 +20,11 @@ def render_graph_rtpt_fixed_x1(denoise=True, path_options=None):
         "enableTemporalReuse": True,
         "enableSpatialReuse": True,
         "useDirectLighting": True,
-        "enablePG": True,  # Share SHaRC training. Generate uses the guide when both reuse passes are off.
+        "enablePG": True,  # Share the diffuse guide across Generate, Talbot Temporal, and Pairwise Spatial.
         "useNRDDemodulation": True,
     }
     options.update(path_options or {})
+    options.setdefault("enableSHARC", options["enablePG"])
     graph.addPass(falcor.createPass("RTPT", options), "PT")
 
     for target in ("Direct", "PT"):

@@ -203,7 +203,11 @@ void RTPT::updateDict(const Dictionary& dict)
     const bool pgWasEnabled = mEnablePG;
     const bool usedPGGenerateShader = usePGGenerateShader();
     const bool collectedPGStats = mPGGenerateStats;
+    const bool collectedPGTemporalStats = mPGTemporalStats;
+    const bool collectedPGSpatialStats = mPGSpatialStats;
+    const bool cachedSpatialPrimary = mPGSpatialCachePrimary;
     const float previousPGFraction = mPGDiffuseFraction;
+    const float previousPGSceneScale = mPGSceneScale;
     const bool usedCache = querySharcInGenerate();
     const bool usedTemporalCache = querySharcInTemporal();
     const bool collectedStats = mSharcGenerateStats;
@@ -217,14 +221,19 @@ void RTPT::updateDict(const Dictionary& dict)
         size_t(dict.keyExists("sharcTemporalDebugMode")) + size_t(dict.keyExists("sharcTemporalDebugDepth")) +
         size_t(dict.keyExists("sharcTemporalUseCache")) + size_t(dict.keyExists(kSharcPretrainSpp)) +
         size_t(dict.keyExists("enablePG")) + size_t(dict.keyExists("pgSceneScale")) +
-        size_t(dict.keyExists("pgDiffuseFraction")) + size_t(dict.keyExists("pgGenerateStats"));
+        size_t(dict.keyExists("pgDiffuseFraction")) + size_t(dict.keyExists("pgGenerateStats")) +
+        size_t(dict.keyExists("pgTemporalStats")) + size_t(dict.keyExists("pgSpatialStats")) +
+        size_t(dict.keyExists("pgSpatialCachePrimary"));
     if (sharcOptionCount && dict.size() == sharcOptionCount)
     {
         const bool queryChanged = usedCache != querySharcInGenerate() || usedTemporalCache != querySharcInTemporal();
         mRecompile |= wasEnabled != mEnableSharc || queryChanged || collectedStats != mSharcGenerateStats || pgWasEnabled != mEnablePG;
-        mRecompile |= usedPGGenerateShader != usePGGenerateShader() || collectedPGStats != mPGGenerateStats;
+        mRecompile |= usedPGGenerateShader != usePGGenerateShader() || collectedPGStats != mPGGenerateStats ||
+            collectedPGTemporalStats != mPGTemporalStats || collectedPGSpatialStats != mPGSpatialStats ||
+            cachedSpatialPrimary != mPGSpatialCachePrimary;
+        mOptionsChanged |= (usedPGGenerateShader && previousPGFraction > 0.f) != (usePGGenerateShader() && mPGDiffuseFraction > 0.f);
         mOptionsChanged |= (usedPGGenerateShader || usePGGenerateShader()) &&
-            (previousPGFraction != mPGDiffuseFraction || pgWasEnabled != mEnablePG);
+            (previousPGFraction != mPGDiffuseFraction || pgWasEnabled != mEnablePG || previousPGSceneScale != mPGSceneScale);
         mOptionsChanged |= queryChanged || previousDebugMode != mSharcDebugMode ||
             (mSharcDebugMode && previousDebugDepth != mSharcDebugDepth);
         return;
@@ -250,6 +259,9 @@ void RTPT::initDict()
     mEnablePG = false;
     mPGDiffuseFraction = kDefaultPGDiffuseFraction;
     mPGGenerateStats = false;
+    mPGTemporalStats = false;
+    mPGSpatialStats = false;
+    mPGSpatialCachePrimary = true;
     mPGSceneScale = kDefaultPGSceneScale;
     releasePG();
     mEnableSharc = false;
@@ -463,6 +475,9 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == "enablePG") mEnablePG = value;
         else if (key == "pgDiffuseFraction") mPGDiffuseFraction = pgFraction;
         else if (key == "pgGenerateStats") mPGGenerateStats = value;
+        else if (key == "pgTemporalStats") mPGTemporalStats = value;
+        else if (key == "pgSpatialStats") mPGSpatialStats = value;
+        else if (key == "pgSpatialCachePrimary") mPGSpatialCachePrimary = value;
         else if (key == "pgSceneScale")
         {
             mPGResetPending |= mPGSceneScale != pgSceneScale;
@@ -639,6 +654,9 @@ Dictionary RTPT::getScriptingDictionary()
     d["enablePG"] = mEnablePG;
     d["pgDiffuseFraction"] = mPGDiffuseFraction;
     d["pgGenerateStats"] = mPGGenerateStats;
+    d["pgTemporalStats"] = mPGTemporalStats;
+    d["pgSpatialStats"] = mPGSpatialStats;
+    d["pgSpatialCachePrimary"] = mPGSpatialCachePrimary;
     d["pgSceneScale"] = mPGSceneScale;
     d["sharcFreeze"] = mSharcFreeze;
     d["sharcUseCache"] = mSharcUseCache;
@@ -660,6 +678,7 @@ Dictionary RTPT::getScriptingDictionary()
 Dictionary RTPT::getSpecializedScriptingDictionary()
 {
     Dictionary d;
+    d["pgSpatialCachePrimary"] = mPGSpatialCachePrimary;
     d[kMaxSurfaceBounces] = mStaticParams.maxSurfaceBounces;
     d[kSpatialMisKind] = uint32_t(mStaticParams.spatialMisKind);
     d[kTemporalMisKind] = uint32_t(mStaticParams.temporalMisKind);
@@ -738,6 +757,9 @@ void RTPT::setScene(RenderContext* pRenderContext, const Scene::SharedPtr& pScen
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    mPGGenerateBoundVersion.reset();
+    mPGTemporalBoundVersion.reset();
+    mPGSpatialBoundVersions.clear();
     if (!beginFrame(pRenderContext, renderData)) return;
     renderData.getDictionary()["enableScreenSpaceReSTIR"] = mUseDirectLighting;
 
@@ -840,20 +862,26 @@ void RTPT::renderUI(Gui::Widgets& widget)
     dirty |= renderDebugUI(widget);
     if (auto group = widget.group("SHaRC radiance cache"))
     {
+        const bool usedPG = usePGGenerateShader();
         if (group.checkbox("Enable path guiding", mEnablePG))
         {
             mRecompile = true;
             dirty = true;
         }
-        group.tooltip("Train using SHaRC paths. Diffuse guiding is available when both reuse passes are disabled.");
-        if (mEnablePG && !mEnableTemporalReuse && !mEnableSpatialReuse &&
-            group.var("Generate diffuse guide fraction", mPGDiffuseFraction, 0.f, 0.999f))
+        group.tooltip("Train using SHaRC paths. Guide diffuse paths in Generate, Talbot Temporal, and Pairwise Spatial.");
+        if (mEnablePG && mStaticParams.useBSDFSampling && supportsPGReuse())
         {
-            mRecompile = true;
-            dirty = true;
+            const bool samplingChanged = group.var("Diffuse guide fraction", mPGDiffuseFraction, 0.f, 0.999f);
+            mRecompile |= samplingChanged;
+            dirty |= samplingChanged;
+            if (mEnableSpatialReuse)
+                mRecompile |= group.checkbox("Cache primary PG lookups during Spatial", mPGSpatialCachePrimary);
         }
         if (mEnablePG && group.var("PG grid scene scale", mPGSceneScale, 0.001f, 1000000.f))
+        {
             mPGResetPending = true;
+            dirty |= usePGGenerateShader();
+        }
         if (group.checkbox("Enable SHaRC", mEnableSharc))
         {
             mRecompile = true;
@@ -865,6 +893,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
                 mSharcTemporalDebugMode = 0;
             }
         }
+        dirty |= usedPG != usePGGenerateShader();
         group.var("Scene-load training (spp)", mSharcPretrainSpp);
         group.tooltip("Training paths per pixel from the starting camera. Changes apply on the next scene load or when the cache is enabled again. Zero skips pretraining.");
         if (mEnableSharc)
@@ -1189,6 +1218,11 @@ void RTPT::updatePrograms()
     specializeSharc(defines);
     mpTracePass->addDefine("PG_GENERATE_GUIDING", usePGGenerateShader() ? "1" : "0");
     mpTracePass->addDefine("PG_GENERATE_STATS", usePGGenerateShader() && mPGGenerateStats ? "1" : "0");
+    mpTemporalReusePass->addDefine("PG_TEMPORAL_GUIDING", usePGTemporalShader() ? "1" : "0");
+    mpTemporalReusePass->addDefine("PG_TEMPORAL_STATS", usePGTemporalShader() && mPGTemporalStats ? "1" : "0");
+    mpSpatialReusePass->addDefine("PG_SPATIAL_GUIDING", usePGSpatialShader() ? "1" : "0");
+    mpSpatialReusePass->addDefine("PG_SPATIAL_STATS", usePGSpatialShader() && mPGSpatialStats ? "1" : "0");
+    mpSpatialReusePass->addDefine("PG_SPATIAL_CACHE_PRIMARY", usePGSpatialShader() && mPGSpatialCachePrimary ? "1" : "0");
     mpTracePass->addDefine("SHARC_GENERATE_QUERY", querySharcInGenerate() ? "1" : "0");
     mpTracePass->addDefine("SHARC_GENERATE_STATS", mSharcGenerateStats ? "1" : "0");
     mpTemporalReusePass->addDefine("SHARC_TEMPORAL_QUERY", querySharcInTemporal() ? "1" : "0");
@@ -1632,10 +1666,9 @@ void RTPT::tracePass(RenderContext* pRenderContext, const RenderData& renderData
     var["CB"]["gSampleId"] = sampleID;
     if (usePGGenerateShader())
     {
-        // The shared pretraining or pending sparse update has published this frame's table.
         auto pg = var["PGGenerateCB"];
-        bindPGRead(pg["pgRead"], false);
-        pg["pgDiffuseFraction"] = mPGDiffuseFraction;
+        bindCurrentPGSampling(pg);
+        mPGGenerateBoundVersion = mPGSnapshots[mPGCurrent].version;
         if (mPGGenerateStats) pg["pgGenerateCounts"] = mpPGGenerateCounts;
     }
     if (querySharcInGenerate())
@@ -1685,6 +1718,18 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
 
     if (isTemporalReuse)
     {
+        if (usePGTemporalShader())
+        {
+            const auto root = pass->getRootVar();
+            const auto pg = root["PGGenerateCB"];
+            bindCurrentPGSampling(pg);
+            mPGTemporalBoundVersion = mPGSnapshots[mPGCurrent].version;
+            if (mPGTemporalStats)
+            {
+                root["pgTemporalCounts"] = mpPGTemporalCounts;
+                pg["pgTemporalReplayCounts"] = mpPGTemporalReplayCounts;
+            }
+        }
         if (querySharcInTemporal())
         {
             const auto cb = pass->getRootVar()["TemporalSharcCB"];
@@ -1705,6 +1750,13 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
     }
     else
     {
+        if (usePGSpatialShader())
+        {
+            const auto root = pass->getRootVar();
+            bindCurrentPGSampling(root["PGGenerateCB"]);
+            mPGSpatialBoundVersions.push_back(mPGSnapshots[mPGCurrent].version);
+            if (mPGSpatialStats) root["pgSpatialCounts"] = mpPGSpatialCounts;
+        }
         var["gSpatialReusePattern"] = uint32_t(mSpatialReusePattern);
         var["gNeighborCount"] = mSpatialNeighborCount;
         var["gGatherRadius"] = mSpatialReuseRadius;
