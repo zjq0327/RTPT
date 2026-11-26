@@ -201,6 +201,9 @@ void RTPT::updateDict(const Dictionary& dict)
 {
     const bool wasEnabled = mEnableSharc;
     const bool pgWasEnabled = mEnablePG;
+    const bool usedPGGenerateShader = usePGGenerateShader();
+    const bool collectedPGStats = mPGGenerateStats;
+    const float previousPGFraction = mPGDiffuseFraction;
     const bool usedCache = querySharcInGenerate();
     const bool usedTemporalCache = querySharcInTemporal();
     const bool collectedStats = mSharcGenerateStats;
@@ -213,11 +216,15 @@ void RTPT::updateDict(const Dictionary& dict)
         size_t(dict.keyExists("sharcDebugMode")) + size_t(dict.keyExists("sharcDebugDepth")) +
         size_t(dict.keyExists("sharcTemporalDebugMode")) + size_t(dict.keyExists("sharcTemporalDebugDepth")) +
         size_t(dict.keyExists("sharcTemporalUseCache")) + size_t(dict.keyExists(kSharcPretrainSpp)) +
-        size_t(dict.keyExists("enablePG")) + size_t(dict.keyExists("pgSceneScale"));
+        size_t(dict.keyExists("enablePG")) + size_t(dict.keyExists("pgSceneScale")) +
+        size_t(dict.keyExists("pgDiffuseFraction")) + size_t(dict.keyExists("pgGenerateStats"));
     if (sharcOptionCount && dict.size() == sharcOptionCount)
     {
         const bool queryChanged = usedCache != querySharcInGenerate() || usedTemporalCache != querySharcInTemporal();
         mRecompile |= wasEnabled != mEnableSharc || queryChanged || collectedStats != mSharcGenerateStats || pgWasEnabled != mEnablePG;
+        mRecompile |= usedPGGenerateShader != usePGGenerateShader() || collectedPGStats != mPGGenerateStats;
+        mOptionsChanged |= (usedPGGenerateShader || usePGGenerateShader()) &&
+            (previousPGFraction != mPGDiffuseFraction || pgWasEnabled != mEnablePG);
         mOptionsChanged |= queryChanged || previousDebugMode != mSharcDebugMode ||
             (mSharcDebugMode && previousDebugDepth != mSharcDebugDepth);
         return;
@@ -241,6 +248,8 @@ void RTPT::initDict()
     const auto screenTiles = mParams.screenTiles;
     Init();
     mEnablePG = false;
+    mPGDiffuseFraction = kDefaultPGDiffuseFraction;
+    mPGGenerateStats = false;
     mPGSceneScale = kDefaultPGSceneScale;
     releasePG();
     mEnableSharc = false;
@@ -379,6 +388,9 @@ bool RTPT::parseDictionary(const Dictionary& dict)
     const float pgSceneScale = dict.keyExists("pgSceneScale") ? float(dict["pgSceneScale"]) : mPGSceneScale;
     if (!(pgSceneScale > 0.f) || !std::isfinite(pgSceneScale))
         throw std::invalid_argument("pgSceneScale must be finite and greater than zero.");
+    const float pgFraction = dict.keyExists("pgDiffuseFraction") ? float(dict["pgDiffuseFraction"]) : mPGDiffuseFraction;
+    if (!(pgFraction >= 0.f && pgFraction < 1.f))
+        throw std::invalid_argument("pgDiffuseFraction must be in [0, 1) to preserve native diffuse sampling support.");
 
     bool needToReset = true;
     for (const auto& [key, value] : dict)
@@ -449,6 +461,8 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kCandidateSamples) mStaticParams.candidateSamples = value;
         else if (key == "enableSHARC") mEnableSharc = value;
         else if (key == "enablePG") mEnablePG = value;
+        else if (key == "pgDiffuseFraction") mPGDiffuseFraction = pgFraction;
+        else if (key == "pgGenerateStats") mPGGenerateStats = value;
         else if (key == "pgSceneScale")
         {
             mPGResetPending |= mPGSceneScale != pgSceneScale;
@@ -623,6 +637,8 @@ Dictionary RTPT::getScriptingDictionary()
     d[kCandidateSamples] = mStaticParams.candidateSamples;
     d["enableSHARC"] = mEnableSharc;
     d["enablePG"] = mEnablePG;
+    d["pgDiffuseFraction"] = mPGDiffuseFraction;
+    d["pgGenerateStats"] = mPGGenerateStats;
     d["pgSceneScale"] = mPGSceneScale;
     d["sharcFreeze"] = mSharcFreeze;
     d["sharcUseCache"] = mSharcUseCache;
@@ -824,7 +840,18 @@ void RTPT::renderUI(Gui::Widgets& widget)
     dirty |= renderDebugUI(widget);
     if (auto group = widget.group("SHaRC radiance cache"))
     {
-        if (group.checkbox("Train path guiding on SHaRC paths", mEnablePG)) mRecompile = true;
+        if (group.checkbox("Enable path guiding", mEnablePG))
+        {
+            mRecompile = true;
+            dirty = true;
+        }
+        group.tooltip("Train using SHaRC paths. Diffuse guiding is available when both reuse passes are disabled.");
+        if (mEnablePG && !mEnableTemporalReuse && !mEnableSpatialReuse &&
+            group.var("Generate diffuse guide fraction", mPGDiffuseFraction, 0.f, 0.999f))
+        {
+            mRecompile = true;
+            dirty = true;
+        }
         if (mEnablePG && group.var("PG grid scene scale", mPGSceneScale, 0.001f, 1000000.f))
             mPGResetPending = true;
         if (group.checkbox("Enable SHaRC", mEnableSharc))
@@ -1160,6 +1187,8 @@ void RTPT::updatePrograms()
     auto defines = mStaticParams.getDefines(*this);
     defines.add("SHARC_MIN_DEPTH", "2");
     specializeSharc(defines);
+    mpTracePass->addDefine("PG_GENERATE_GUIDING", usePGGenerateShader() ? "1" : "0");
+    mpTracePass->addDefine("PG_GENERATE_STATS", usePGGenerateShader() && mPGGenerateStats ? "1" : "0");
     mpTracePass->addDefine("SHARC_GENERATE_QUERY", querySharcInGenerate() ? "1" : "0");
     mpTracePass->addDefine("SHARC_GENERATE_STATS", mSharcGenerateStats ? "1" : "0");
     mpTemporalReusePass->addDefine("SHARC_TEMPORAL_QUERY", querySharcInTemporal() ? "1" : "0");
@@ -1601,6 +1630,14 @@ void RTPT::tracePass(RenderContext* pRenderContext, const RenderData& renderData
     // Bind the path tracer.
     var["gPathTracer"] = mpPathTracerBlock;
     var["CB"]["gSampleId"] = sampleID;
+    if (usePGGenerateShader())
+    {
+        // The shared pretraining or pending sparse update has published this frame's table.
+        auto pg = var["PGGenerateCB"];
+        bindPGRead(pg["pgRead"], false);
+        pg["pgDiffuseFraction"] = mPGDiffuseFraction;
+        if (mPGGenerateStats) pg["pgGenerateCounts"] = mpPGGenerateCounts;
+    }
     if (querySharcInGenerate())
     {
         bindSharc(var["CB"]["gSharcQuery"]);

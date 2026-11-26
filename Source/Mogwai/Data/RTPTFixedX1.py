@@ -20,7 +20,7 @@ def render_graph_rtpt_fixed_x1(denoise=True, path_options=None):
         "enableTemporalReuse": True,
         "enableSpatialReuse": True,
         "useDirectLighting": True,
-        "enablePG": True,  # Collect on shared SHaRC training paths when SHaRC is enabled.
+        "enablePG": True,  # Share SHaRC training. Generate uses the guide when both reuse passes are off.
         "useNRDDemodulation": True,
     }
     options.update(path_options or {})

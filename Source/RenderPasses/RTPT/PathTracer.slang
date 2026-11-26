@@ -49,6 +49,12 @@ __exported import Params;
 #ifndef SHARC_TEMPORAL_STATS
 #define SHARC_TEMPORAL_STATS 0
 #endif
+#ifndef PG_GENERATE_GUIDING
+#define PG_GENERATE_GUIDING 0
+#endif
+#if PG_GENERATE_GUIDING
+import PGDiffuse;
+#endif
 #if SHARC_GENERATE_QUERY || SHARC_GENERATE_STATS
 import TracePassParams;
 #endif
@@ -295,7 +301,7 @@ struct PathTracer
         \param[in,out] path The path state.
         \return True if a ray was generated, false otherwise.
     */
-    bool generateScatterRay(const ShadingData sd, inout PathState path)
+    bool generateScatterRay(const ShadingData sd, inout PathState path, float4 pgMass = 0.f)
     {
         bool isCurveHit = path.hit.getType() == HitType::Curve;
 
@@ -303,7 +309,14 @@ struct PathTracer
         bool valid;
         BSDFSample_ result;
 
-        if (kUseBSDFSampling) valid = sampleBSDF(sd, path.sg, result, !kSeparatePathBSDF); // daqi: indicate using deterministic BSDF
+        if (kUseBSDFSampling)
+        {
+#if PG_GENERATE_GUIDING
+            valid = sampleWithDiffusePG(sd, path.sg, pgMass, !kSeparatePathBSDF, result);
+#else
+            valid = sampleBSDF(sd, path.sg, result, !kSeparatePathBSDF);
+#endif
+        }
         else valid = sampleBSDF_Reference(sd, path.sg, result);
 
         float pdfAll = result.pdf;
@@ -1137,6 +1150,11 @@ struct PathTracer
         // The available lobes depend on the material.
         uint lobes = getBSDFLobes(sd);
 
+#if PG_GENERATE_GUIDING
+        float4 pgMass = lookupDiffusePG(sd);
+#else
+        const float4 pgMass = 0.f;
+#endif
         bool supportsNEE = (lobes & (uint)LobeType::NonDelta) != 0;
 
         // Check if we should apply NEE.
@@ -1225,7 +1243,11 @@ struct PathTracer
 
                     if (kUseMIS && ls.lightType != (uint)LightSampleType::Analytic)
                     {
+#if PG_GENERATE_GUIDING
+                        scatterPdf = evalScatterPdfWithDiffusePG(sd, ls.dir, pgMass);
+#else
                         scatterPdf = evalPdfBSDF(sd, ls.dir);
+#endif
 
                         misWeight *= evalMIS(1, ls.pdf, 1, scatterPdf);
                     }
@@ -1296,7 +1318,7 @@ struct PathTracer
         }
 
         // Generate the next path segment or terminate.
-        bool valid = generateScatterRay(sd, path);
+        bool valid = generateScatterRay(sd, path, pgMass);
 
         // cache seed for temporal validation (only possible for non early direction reuse since it uses the cachedRandomSeed slot)
         if (path.length == path.pathBuilder.rcVertexLength)

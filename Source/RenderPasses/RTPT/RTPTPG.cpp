@@ -19,6 +19,7 @@ void RTPT::releasePG()
     mpPGPublish.reset();
     mpPGBuildKeys = mpPGAccumulation = mpPGCounts = mpPGDiagnostics = nullptr;
     mpPGHistoryMean = mpPGHistoryCount = nullptr;
+    mpPGGenerateCounts.reset();
     for (auto& snapshot : mPGSnapshots) snapshot = {};
     mPGCurrent = mPGPrevious = 0;
     mPGPublishPending = false;
@@ -30,9 +31,24 @@ void RTPT::releasePG()
     mPGLastTrainingFrame = mPGLastTrainingSample = 0;
 }
 
+bool RTPT::usePGGenerateShader() const
+{
+    // The reuse shaders still evaluate native BSDF densities.
+    return mEnablePG && (mEnableSharc || mpPGBuildKeys) && mStaticParams.useBSDFSampling &&
+        !mEnableTemporalReuse && !mEnableSpatialReuse && (mPGDiffuseFraction > 0.f || mPGGenerateStats);
+}
+
 void RTPT::preparePG(RenderContext* context)
 {
     mPGPublishedThisFrame = false;
+    if (usePGGenerateShader() && mPGGenerateStats)
+    {
+        if (!mpPGGenerateCounts)
+            mpPGGenerateCounts = Buffer::createStructured(sizeof(uint32_t), kPGGenerateCounterCount,
+                Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
+        clearPGBuffer(context, mpPGGenerateCounts);
+    }
+    else mpPGGenerateCounts.reset();
     if (!mpPGBuildKeys)
     {
         const auto flags = Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess;
@@ -181,6 +197,15 @@ pybind11::dict RTPT::getPGStats() const
 {
     pybind11::dict stats;
     stats["enabled"] = mEnablePG;
+    stats["generateGuidingEnabled"] = usePGGenerateShader() && mPGDiffuseFraction > 0.f;
+    stats["diffuseFraction"] = mPGDiffuseFraction;
+    const char* generateCounters[kPGGenerateCounterCount] = {
+        "diffuseEligible", "diffuseTableHits", "pgDiffuseDraws", "pgSpecularDraws", "nativeSpecularDraws", "nativeDiffuseDraws"
+    };
+    const uint32_t* counts = mpPGGenerateCounts ?
+        static_cast<const uint32_t*>(mpPGGenerateCounts->map(Buffer::MapType::Read)) : nullptr;
+    for (uint32_t i = 0; i < kPGGenerateCounterCount; ++i) stats[generateCounters[i]] = counts ? counts[i] : 0u;
+    if (counts) mpPGGenerateCounts->unmap();
     stats["capacity"] = mpPGBuildKeys ? kPGCapacity : 0u;
     stats["sceneScale"] = mPGSceneScale;
     stats["publications"] = mPGPublications;

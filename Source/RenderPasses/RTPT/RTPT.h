@@ -65,6 +65,7 @@ private:
     void releasePG();
     void bindPGTraining(const ShaderVar& var) const;
     void bindPGRead(const ShaderVar& var, bool previousFrame) const;
+    bool usePGGenerateShader() const;
     void barrierPGTraining(RenderContext* pRenderContext) const;
     void notePGTraining(uint32_t stride, bool pretrain);
     void finishPGTraining(RenderContext* pRenderContext, bool immediate);
@@ -222,6 +223,11 @@ private:
     Buffer::SharedPtr               mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved, mpSharcMotionBounds;
 
     bool                            mEnablePG = false;
+    static constexpr float          kDefaultPGDiffuseFraction = 0.5f;
+    float                           mPGDiffuseFraction = kDefaultPGDiffuseFraction;
+    bool                            mPGGenerateStats = false;
+    static constexpr uint32_t       kPGGenerateCounterCount = 6;
+    Buffer::SharedPtr               mpPGGenerateCounts;
     ComputePass::SharedPtr          mpSharcPGUpdate, mpPGPublish;
     Buffer::SharedPtr               mpPGBuildKeys, mpPGAccumulation, mpPGCounts, mpPGDiagnostics;
     Buffer::SharedPtr               mpPGHistoryMean, mpPGHistoryCount;
