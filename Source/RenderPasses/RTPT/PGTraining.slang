@@ -8,7 +8,6 @@ struct PGWrite
     RWStructuredBuffer<uint2> keys;
     RWStructuredBuffer<uint4> accumulation;
     RWStructuredBuffer<uint> counts;
-    RWStructuredBuffer<uint> diagnostics;
 };
 
 bool pgTrainingAddress(PGWrite model, float3 position, float3 orientedNormal, float3 direction,
@@ -19,24 +18,16 @@ bool pgTrainingAddress(PGWrite model, float3 position, float3 orientedNormal, fl
         pgDirectionBin(orientedNormal, direction, quadrant);
 }
 
-float pgTrainingWeight(float3 incident, float samplePdf, float survival)
+float pgTrainingWeight(float3 incident, float density)
 {
-    if (!all(isfinite(incident)) || !isfinite(samplePdf) || !(samplePdf > 0.f) ||
-        !(survival > 0.f && survival <= 1.f)) return -1.f;
-    return dot(max(incident, 0.f), float3(1.f / 3.f)) / (samplePdf * survival);
+    if (!all(isfinite(incident)) || !isfinite(density) || !(density > 0.f)) return -1.f;
+    return dot(max(incident, 0.f), float3(1.f / 3.f)) / density;
 }
 
 void pgTrainAddress(PGWrite model, uint2 key, uint quadrant, float weight)
 {
     if (model.capacity == 0u) return;
-#if SHARC_TRAINING_STATS
-    InterlockedAdd(model.diagnostics[0], 1u);
-#endif
-    if (!all(key != 0u) || quadrant >= 4u || !isfinite(weight) || weight < 0.f)
-    {
-        InterlockedAdd(model.diagnostics[4], 1u);
-        return;
-    }
+    if (!all(key != 0u) || quadrant >= 4u || !isfinite(weight) || weight < 0.f) return;
     uint slot = pgFirstSlot(key, model.capacity);
     for (uint probe = 0u; probe < min(model.capacity, kPGProbeCount); ++probe)
     {
@@ -58,11 +49,7 @@ void pgTrainAddress(PGWrite model, uint2 key, uint quadrant, float weight)
                     for (;;)
                     {
                         const float sum = asfloat(previous) + scaled;
-                        if (!isfinite(sum))
-                        {
-                            InterlockedAdd(model.diagnostics[4], 1u);
-                            return;
-                        }
+                        if (!isfinite(sum)) return;
                         uint observed;
                         InterlockedCompareExchange(model.accumulation[slot][quadrant], previous, asuint(sum), observed);
                         if (observed == previous) break;
@@ -70,14 +57,10 @@ void pgTrainAddress(PGWrite model, uint2 key, uint quadrant, float weight)
                     }
                 }
                 InterlockedAdd(model.counts[slot], 1u);
-#if SHARC_TRAINING_STATS
-                InterlockedAdd(model.diagnostics[weight > 0.f ? 1u : 2u], 1u);
-#endif
                 return;
             }
         }
         slot = (slot + 1u == model.capacity) ? 0u : slot + 1u;
     }
-    InterlockedAdd(model.diagnostics[3], 1u);
 }
 

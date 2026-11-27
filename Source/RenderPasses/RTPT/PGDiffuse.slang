@@ -11,6 +11,7 @@ import Rendering.Materials.MaterialShading;
 cbuffer PGGenerateCB
 {
     PGRead pgRead;
+    bool pgEnabled;
     float pgDiffuseFraction;
 #if PG_GENERATE_STATS
     RWStructuredBuffer<uint> pgGenerateCounts;
@@ -27,6 +28,7 @@ float3 pgOrientedNormal(ShadingData sd)
 float4 lookupDiffusePG(ShadingData sd, out bool requestedGrid)
 {
     requestedGrid = false;
+    if (!pgEnabled) return 0.f;
     if ((sd.getActiveLobes() & uint(LobeType::DiffuseReflection)) == 0u ||
         !any(sd.diffuse > 0.f) || sd.metallic >= 1.f ||
         sd.specularTransmission >= 1.f || sd.diffuseTransmission >= 1.f) return 0.f;

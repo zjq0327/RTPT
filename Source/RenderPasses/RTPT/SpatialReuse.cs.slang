@@ -174,7 +174,7 @@ struct PathReusePass
                 }
                 else
                 {
-                    possibleToBeSelected = shiftAndMergeReservoir(params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
+                    possibleToBeSelected = shiftAndMergeReservoir<0>(params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
                         neighborPrimarySd, neighborReservoir, true, sg, 1.f, true); // "true" means hypothetically selected as the sample
                 }
 
@@ -206,7 +206,7 @@ struct PathReusePass
                             if (!isValidGeometry(centralPrimarySd, tneighborPrimarySd)) continue;
 
                             float tneighborJacobian;
-                            float3 tneighborIntegrand = computeShiftedIntegrand(params, tneighborJacobian, tneighborPrimarySd,
+                            float3 tneighborIntegrand = computeShiftedIntegrand<0>(params, tneighborJacobian, tneighborPrimarySd,
                                 centralPrimarySd, tempDstReservoir, true);
                             float p_ = PathReservoir::computeWeight(tneighborIntegrand) * tneighborJacobian;
                             p_sum += p_ * tneighborReservoir.M;
@@ -254,7 +254,7 @@ struct PathReusePass
                 float prefixJacobian;
 
                 float4 neighborPGMass = -1.f; // Shared only by the two shifts for this neighbor.
-                float3 prefixIntegrand = computeShiftedIntegrand(neighborPGMass, centralPGMass, params, prefixJacobian, neighborPrimarySd,
+                float3 prefixIntegrand = computeShiftedIntegrand<0>(neighborPGMass, centralPGMass, params, prefixJacobian, neighborPrimarySd,
                     centralPrimarySd, centralReservoir, true, true);
 
                 prefix_approxPdf = PathReservoir::computeWeight(prefixIntegrand) * prefixJacobian;
@@ -265,7 +265,7 @@ struct PathReusePass
 
                 PathReservoir tempDstReservoir = dstReservoir;
 
-                bool possibleToBeSelected = shiftAndMergeReservoir(centralPGMass, neighborPGMass, params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
+                bool possibleToBeSelected = shiftAndMergeReservoir<0>(centralPGMass, neighborPGMass, params, false, dstJacobian, centralPrimarySd, tempDstReservoir,
                     neighborPrimarySd, neighborReservoir, true, sg, 1.f, true); // "true" means hypothetically selected as the sample
 
                 float neighborWeight = 0.f;
@@ -317,7 +317,7 @@ struct PathReusePass
 
                 float dstJacobian;
 
-                bool selected = shiftAndMergeReservoir(params, false, dstJacobian, centralPrimarySd, dstReservoir,
+                bool selected = shiftAndMergeReservoir<0>(params, false, dstJacobian, centralPrimarySd, dstReservoir,
                     neighborPrimarySd, neighborReservoir, true, sg);
 
                 if (selected)
@@ -381,7 +381,7 @@ struct PathReusePass
                         float prefix_approxPdf;
                         int shiftCount = 0;
 
-                        float3 prefixIntegrand = computeShiftedIntegrand(params, prefixJacobian, prefixPrimarySd,
+                        float3 prefixIntegrand = computeShiftedIntegrand<0>(params, prefixJacobian, prefixPrimarySd,
                             centralPrimarySd, dstReservoir, true);
                         prefix_approxPdf = PathReservoir::computeWeight(prefixIntegrand) * prefixJacobian;
 

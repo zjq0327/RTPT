@@ -31,7 +31,6 @@ public:
 
     virtual std::string getDesc() override;
     virtual Dictionary getScriptingDictionary() override;
-    Dictionary getSpecializedScriptingDictionary();
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
     virtual void compile(RenderContext* pContext, const CompileData& compileData) override;
     virtual void setScene(RenderContext* pRenderContext, const Scene::SharedPtr& pScene) override;
@@ -60,29 +59,22 @@ private:
     void bindSharc(const ShaderVar& var) const;
     void trackSharcMotion(bool lightingChanged);
     void updateSharc(RenderContext* pRenderContext);
-    void traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainPG = false);
+    void traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainSharc, bool trainPG);
+    void updateGuidingOptions(bool pgWasEnabled, bool sharcWasEnabled);
     void resolveSharcTraining(RenderContext* pRenderContext);
     void preparePG(RenderContext* pRenderContext);
     void releasePG();
     void bindPGTraining(const ShaderVar& var) const;
     void bindCurrentPGSampling(const ShaderVar& var) const;
-    bool supportsPGReuse() const;
-    bool usePGGenerateShader() const;
-    bool usePGTemporalShader() const;
-    bool usePGSpatialShader() const;
     void barrierPGTraining(RenderContext* pRenderContext) const;
     void notePGTraining(uint32_t stride, bool pretrain);
     void finishPGTraining(RenderContext* pRenderContext, bool immediate);
     void publishPG(RenderContext* pRenderContext);
     pybind11::dict getPGStats() const;
     pybind11::dict getSharcStats() const;
-    pybind11::dict getSharcGenerateStats() const;
-    std::vector<uint32_t> getSharcTemporalStats() const;
     pybind11::bytes getSharcFreshReservoirs() const;
     pybind11::bytes getSharcTemporalReservoirs() const;
     pybind11::bytes getSharcSpatialReservoirs() const;
-    bool querySharcInGenerate() const { return mEnableSharc && mSharcUseCache; }
-    bool querySharcInTemporal() const { return mEnableTemporalReuse && mSharcTemporalUseCache && querySharcInGenerate(); }
     void prepareMaterials(RenderContext* pRenderContext);
     bool prepareLighting(RenderContext* pRenderContext);
     void setShaderData(const ShaderVar& var, const RenderData& renderData, bool isPathTracer, bool isPathGenerator) const;
@@ -109,7 +101,7 @@ private:
         uint32_t    maxTransmissionBounces = -1;                ///< Max number of transmission bounces (0 = none), up to kMaxBounces. This will be initialized at startup.
         uint32_t    sampleGenerator = SAMPLE_GENERATOR_TINY_UNIFORM; ///< Pseudorandom sample generator type.
         bool        adjustShadingNormals = false;               ///< Adjust shading normals on secondary hits.
-        bool        useBSDFSampling = true;                     ///< Use BRDF importance sampling, otherwise cosine-weighted hemisphere sampling.
+        static constexpr bool useBSDFSampling = true;
         bool        useNEE = true;                              ///< Use next-event estimation (NEE). This enables shadow ray(s) from each path vertex.
         bool        useMIS = true;                              ///< Use multiple importance sampling (MIS) when NEE is enabled.
         bool        useRussianRoulette = false;                 ///< Use russian roulette to terminate low throughput paths.
@@ -129,8 +121,8 @@ private:
 
         bool        useDeterministicBSDF = true;                    ///< Evaluate all compatible lobes at BSDF sampling time.
 
-        ReSTIRMISKind    spatialMisKind = ReSTIRMISKind::Pairwise;
-        ReSTIRMISKind    temporalMisKind = ReSTIRMISKind::Talbot;
+        static constexpr ReSTIRMISKind spatialMisKind = ReSTIRMISKind::Pairwise;
+        static constexpr ReSTIRMISKind temporalMisKind = ReSTIRMISKind::Talbot;
 
         bool            temporalUpdateForDynamicScene = false;
 
@@ -149,8 +141,6 @@ private:
     {
         mStaticParams = StaticParams();
         mParams = RestirPathTracerParams();
-        mEnableTemporalReuse = true;
-        mEnableSpatialReuse = true;
         mSpatialReusePattern = SpatialReusePattern::Default;
         mSmallWindowRestirWindowRadius = 2;
         mSpatialNeighborCount = 3;
@@ -191,18 +181,8 @@ private:
     PixelDebug::SharedPtr           mpPixelDebug;               ///< Utility class for pixel debugging (print in shaders).
     ParameterBlock::SharedPtr       mpPathTracerBlock;          ///< Parameter block for the path tracer.
 
-    bool                            mEnableSharc = false;
+    bool                            mEnableSharc = true;
     bool                            mSharcFreeze = false;
-    bool                            mSharcUseCache = false;
-    bool                            mSharcTemporalUseCache = true;
-    bool                            mSharcGenerateStats = false;
-    uint32_t                        mSharcDebugMode = 0;
-    uint32_t                        mSharcDebugDepth = 2;
-    uint32_t                        mSharcTemporalDebugMode = 0;
-    uint32_t                        mSharcTemporalDebugDepth = 2;
-    Buffer::SharedPtr               mpSharcGenerateStats;
-    Buffer::SharedPtr               mpSharcTrainingStats;
-    Buffer::SharedPtr               mpSharcTemporalStats;
     bool                            mSharcNeedsClear = true;
     bool                            mSharcPretrainPending = true;
     static constexpr uint32_t       kDefaultSharcPretrainSpp = 8;
@@ -226,13 +206,13 @@ private:
     ComputePass::SharedPtr          mpSharcUpdate, mpSharcResolve, mpSharcInvalidate;
     Buffer::SharedPtr               mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved, mpSharcMotionBounds;
 
-    bool                            mEnablePG = false;
+    bool                            mEnablePG = true;
+    uint32_t                        mPGNextTrainingSample = 0;
     static constexpr float          kDefaultPGDiffuseFraction = 0.5f;
     float                           mPGDiffuseFraction = kDefaultPGDiffuseFraction;
     bool                            mPGGenerateStats = false;
     bool                            mPGTemporalStats = false;
     bool                            mPGSpatialStats = false;
-    bool                            mPGSpatialCachePrimary = true;
     static constexpr uint32_t       kPGGenerateCounterCount = 6;
     static constexpr uint32_t       kPGTemporalCounterCount = 8;
     static constexpr uint32_t       kPGSpatialCounterCount = 10;
@@ -241,7 +221,7 @@ private:
     std::optional<uint64_t>         mPGGenerateBoundVersion, mPGTemporalBoundVersion;
     std::vector<uint64_t>           mPGSpatialBoundVersions;
     ComputePass::SharedPtr          mpSharcPGUpdate, mpPGPublish;
-    Buffer::SharedPtr               mpPGBuildKeys, mpPGAccumulation, mpPGCounts, mpPGDiagnostics;
+    Buffer::SharedPtr               mpPGBuildKeys, mpPGAccumulation, mpPGCounts;
     Buffer::SharedPtr               mpPGHistoryMean, mpPGHistoryCount;
     static constexpr uint32_t       kPGCapacity = 65536;
     static constexpr float          kDefaultPGSceneScale = 8.f;
@@ -273,13 +253,7 @@ private:
     bool                            mOutputNRDData = false;     ///< True if NRD diffuse/specular data should be generated as outputs.
     bool                            mEnableRayStats = false;      ///< Set to true when the stats tab in the UI is open. This may negatively affect performance.
 
-    uint64_t                        mAccumulatedRayCount = 0;
-    uint64_t                        mAccumulatedClosestHitRayCount = 0;
-    uint64_t                        mAccumulatedShadowRayCount = 0;
-
     // params below
-    bool                            mEnableTemporalReuse = true;
-    bool                            mEnableSpatialReuse = true;
     SpatialReusePattern             mSpatialReusePattern = SpatialReusePattern::Default;
     uint32_t                        mSmallWindowRestirWindowRadius = 2;
     int                             mSpatialNeighborCount = 3;
@@ -311,12 +285,7 @@ private:
 
     ComputePass::SharedPtr          mpReflectTypes;             ///< Helper for reflecting structured buffer types.
 
-    GpuFence::SharedPtr             mpReadbackFence;            ///< GPU fence for synchronizing stats readback.
-
     // Data
-    Buffer::SharedPtr               mpCounters;                 ///< Atomic counters (32-bit).
-    Buffer::SharedPtr               mpCountersReadback;         ///< Readback buffer for the counters for stats gathering.
-
     Buffer::SharedPtr               mpOutputReservoirs;               ///< Output paths from the path sampling stage.
     // enable multiple temporal reservoirs for spp > 1 (multiple ReSTIR chains)
     std::vector<Buffer::SharedPtr>               mpTemporalReservoirs;               ///< Output paths from the path sampling stage.

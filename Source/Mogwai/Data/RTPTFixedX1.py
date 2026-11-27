@@ -17,14 +17,12 @@ def render_graph_rtpt_fixed_x1(denoise=True, path_options=None):
         "samplesPerPixel": 1,
         "candidateSamples": 1,
         "maxSurfaceBounces": 5,
-        "enableTemporalReuse": True,
-        "enableSpatialReuse": True,
         "useDirectLighting": True,
-        "enablePG": True,  # Share the diffuse guide across Generate, Talbot Temporal, and Pairwise Spatial.
+        "enablePG": True,
+        "enableSHARC": True,
         "useNRDDemodulation": True,
     }
     options.update(path_options or {})
-    options.setdefault("enableSHARC", options["enablePG"])
     graph.addPass(falcor.createPass("RTPT", options), "PT")
 
     for target in ("Direct", "PT"):

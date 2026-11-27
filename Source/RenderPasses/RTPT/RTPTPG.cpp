@@ -17,7 +17,8 @@ namespace
 void RTPT::releasePG()
 {
     mpPGPublish.reset();
-    mpPGBuildKeys = mpPGAccumulation = mpPGCounts = mpPGDiagnostics = nullptr;
+    if (mpSharcPGUpdate) mpSharcPGUpdate->setVars(nullptr);
+    mpPGBuildKeys = mpPGAccumulation = mpPGCounts = nullptr;
     mpPGHistoryMean = mpPGHistoryCount = nullptr;
     mpPGGenerateCounts = mpPGTemporalCounts = mpPGTemporalReplayCounts = nullptr;
     mpPGSpatialCounts.reset();
@@ -33,29 +34,7 @@ void RTPT::releasePG()
     mPGPretrainDispatches = mPGRuntimeDispatches = 0;
     mPGPretrainPaths = mPGRuntimePaths = 0;
     mPGLastTrainingFrame = mPGLastTrainingSample = 0;
-}
-
-bool RTPT::supportsPGReuse() const
-{
-    return (!mEnableTemporalReuse || mStaticParams.temporalMisKind == ReSTIRMISKind::Talbot) &&
-        (!mEnableSpatialReuse || mStaticParams.spatialMisKind == ReSTIRMISKind::Pairwise);
-}
-
-bool RTPT::usePGGenerateShader() const
-{
-    return mEnablePG && (mEnableSharc || mpPGBuildKeys) && mStaticParams.useBSDFSampling && supportsPGReuse() &&
-        (mPGDiffuseFraction > 0.f || mPGGenerateStats || (mEnableTemporalReuse && mPGTemporalStats) ||
-         (mEnableSpatialReuse && mPGSpatialStats));
-}
-
-bool RTPT::usePGTemporalShader() const
-{
-    return mEnableTemporalReuse && usePGGenerateShader();
-}
-
-bool RTPT::usePGSpatialShader() const
-{
-    return mEnableSpatialReuse && usePGGenerateShader();
+    mPGNextTrainingSample = 0;
 }
 
 void RTPT::preparePG(RenderContext* context)
@@ -69,11 +48,10 @@ void RTPT::preparePG(RenderContext* context)
                 Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
         clearPGBuffer(context, buffer);
     };
-    prepareCounters(mpPGGenerateCounts, kPGGenerateCounterCount, usePGGenerateShader() && mPGGenerateStats);
-    const bool temporalStats = usePGTemporalShader() && mPGTemporalStats;
-    prepareCounters(mpPGTemporalCounts, kPGTemporalCounterCount, temporalStats);
-    prepareCounters(mpPGTemporalReplayCounts, kPGGenerateCounterCount, temporalStats);
-    prepareCounters(mpPGSpatialCounts, kPGSpatialCounterCount, usePGSpatialShader() && mPGSpatialStats);
+    prepareCounters(mpPGGenerateCounts, kPGGenerateCounterCount, mPGGenerateStats);
+    prepareCounters(mpPGTemporalCounts, kPGTemporalCounterCount, mPGTemporalStats);
+    prepareCounters(mpPGTemporalReplayCounts, kPGGenerateCounterCount, mPGTemporalStats);
+    prepareCounters(mpPGSpatialCounts, kPGSpatialCounterCount, mPGSpatialStats);
     if (!mpPGBuildKeys)
     {
         const auto flags = Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess;
@@ -88,7 +66,6 @@ void RTPT::preparePG(RenderContext* context)
         mpPGCounts = allocate(4u, kPGCapacity);
         mpPGHistoryMean = allocate(16u, kPGCapacity);
         mpPGHistoryCount = allocate(4u, kPGCapacity);
-        mpPGDiagnostics = allocate(4u, 8u);
         for (auto& snapshot : mPGSnapshots)
         {
             snapshot.keys = allocate(8u, kPGCapacity);
@@ -101,7 +78,7 @@ void RTPT::preparePG(RenderContext* context)
         mpPGPublish = ComputePass::create(desc, {}, true);
         mPGResetPending = false;
     }
-    else if (mPGResetPending || (mEnableSharc && mSharcNeedsClear))
+    else if (mPGResetPending || mSharcNeedsClear)
     {
         // A scene-wide transport change invalidates the previous observations.
         // Keep the previous publication available for diagnostics.
@@ -113,12 +90,7 @@ void RTPT::preparePG(RenderContext* context)
         mPGResetPending = false;
         mPGPublishPending = false;
         mPGPrevious = mPGCurrent;
-        if (mEnableSharc && mSharcPretrainPending && mSharcPretrainSpp > 0)
-        {
-            // The shared warm-up will publish directly into the other slot before Generate.
-            mPGCarryPrevious = false;
-            return;
-        }
+        mPGCarryPrevious = false;
         mPGCurrent ^= 1u;
         auto& current = mPGSnapshots[mPGCurrent];
         clearPGBuffer(context, current.keys);
@@ -140,25 +112,25 @@ void RTPT::bindPGTraining(const ShaderVar& var) const
     var["keys"] = mpPGBuildKeys;
     var["accumulation"] = mpPGAccumulation;
     var["counts"] = mpPGCounts;
-    var["diagnostics"] = mpPGDiagnostics;
 }
 
 void RTPT::bindCurrentPGSampling(const ShaderVar& cb) const
 {
     // Generate, temporal shifts and replay, and every spatial round use this frame's immutable publication.
     const auto& snapshot = mPGSnapshots[mPGCurrent];
+    cb["pgEnabled"] = mEnablePG && (mPGDiffuseFraction > 0.f || mPGGenerateStats || mPGTemporalStats || mPGSpatialStats);
     cb["pgDiffuseFraction"] = mPGDiffuseFraction;
     const auto var = cb["pgRead"];
-    var["capacity"] = snapshot.keys ? kPGCapacity : 0u;
+    var["capacity"] = mEnablePG && snapshot.keys ? kPGCapacity : 0u;
     var["cameraPosition"] = snapshot.cameraPosition;
     var["sceneScale"] = snapshot.sceneScale;
-    var["keys"] = snapshot.keys;
-    var["mass"] = snapshot.mass;
+    var["keys"] = mEnablePG ? snapshot.keys : nullptr;
+    var["mass"] = mEnablePG ? snapshot.mass : nullptr;
 }
 
 void RTPT::barrierPGTraining(RenderContext* context) const
 {
-    for (const auto& buffer : {mpPGBuildKeys, mpPGAccumulation, mpPGCounts, mpPGDiagnostics})
+    for (const auto& buffer : {mpPGBuildKeys, mpPGAccumulation, mpPGCounts})
         context->uavBarrier(buffer.get());
 }
 
@@ -177,7 +149,6 @@ void RTPT::notePGTraining(uint32_t stride, bool pretrain)
         mPGRuntimePaths += paths;
     }
     mPGLastTrainingFrame = mPGRuntimeFrameCount;
-    mPGLastTrainingSample = mSharcFrameIndex;
     mPGTrainingCamera = mpScene->getCamera()->getPosition();
 }
 
@@ -225,15 +196,16 @@ pybind11::dict RTPT::getPGStats() const
 {
     pybind11::dict stats;
     stats["enabled"] = mEnablePG;
-    stats["generateGuidingEnabled"] = usePGGenerateShader() && mPGDiffuseFraction > 0.f;
-    stats["temporalGuidingEnabled"] = usePGTemporalShader() && mPGDiffuseFraction > 0.f;
-    stats["spatialGuidingEnabled"] = usePGSpatialShader() && mPGDiffuseFraction > 0.f;
+    const bool guidingEnabled = mEnablePG && mPGDiffuseFraction > 0.f;
+    stats["generateGuidingEnabled"] = guidingEnabled;
+    stats["temporalGuidingEnabled"] = guidingEnabled;
+    stats["spatialGuidingEnabled"] = guidingEnabled;
     stats["generateBoundVersion"] = mPGGenerateBoundVersion ? pybind11::cast(*mPGGenerateBoundVersion) : pybind11::none();
     stats["temporalBoundVersion"] = mPGTemporalBoundVersion ? pybind11::cast(*mPGTemporalBoundVersion) : pybind11::none();
     stats["spatialBoundVersions"] = mPGSpatialBoundVersions;
     stats["spatialBoundVersion"] = mPGSpatialBoundVersions.empty() ? pybind11::none() : pybind11::cast(mPGSpatialBoundVersions.back());
     stats["diffuseFraction"] = mPGDiffuseFraction;
-    stats["spatialCachePrimary"] = mPGSpatialCachePrimary;
+    stats["spatialCachePrimary"] = true;
     const char* generateCounters[kPGGenerateCounterCount] = {
         "diffuseEligible", "diffuseTableHits", "pgDiffuseDraws", "pgSpecularDraws", "nativeSpecularDraws", "nativeDiffuseDraws"
     };
@@ -277,14 +249,6 @@ pybind11::dict RTPT::getPGStats() const
     stats["trainingPaths"] = mPGPretrainPaths + mPGRuntimePaths;
     stats["lastTrainingFrame"] = mPGLastTrainingFrame;
     stats["lastTrainingSample"] = mPGLastTrainingSample;
-    std::vector<uint32_t> diagnostics(8u);
-    if (mpPGDiagnostics)
-    {
-        const auto* data = static_cast<const uint32_t*>(mpPGDiagnostics->map(Buffer::MapType::Read));
-        std::copy_n(data, diagnostics.size(), diagnostics.begin());
-        mpPGDiagnostics->unmap();
-    }
-    stats["diagnostics"] = diagnostics;
 
     auto readSnapshot = [](const PGSnapshot& snapshot)
     {

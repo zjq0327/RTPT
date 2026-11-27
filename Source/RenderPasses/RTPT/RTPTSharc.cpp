@@ -2,8 +2,6 @@
  # Copyright (c) 2022, Daqi Lin. All rights reserved.
  **************************************************************************/
 #include "RTPT.h"
-#include <array>
-#include <cstring>
 
 namespace
 {
@@ -11,14 +9,6 @@ namespace
     constexpr uint32_t kSharcUpdateStride = 5;
     constexpr uint32_t kSharcPretrainBatchSpp = 8;
     constexpr uint32_t kPGTrainingInterval = 4;
-    constexpr uint32_t kTrainingCounterCount = 6;
-    constexpr uint32_t kGenerateDepthCount = 16;
-    constexpr uint32_t kGenerateMetricCount = 8;
-    constexpr uint32_t kGenerateProbeOffset = kGenerateDepthCount * kGenerateMetricCount;
-    constexpr uint32_t kGenerateRayCountOffset = kGenerateProbeOffset + 16;
-    constexpr uint32_t kGenerateCounterCount = kGenerateRayCountOffset + kGenerateDepthCount;
-    // Five depth histograms followed by sixteen scalar slots in the Temporal shader.
-    constexpr uint32_t kTemporalCounterCount = 6u * kGenerateDepthCount;
     const char kSharcUpdateFile[] = "RenderPasses/RTPT/SharcUpdate.cs.slang";
     const char kSharcResolveFile[] = "RenderPasses/ReSTIRPTPass/SharcResolve.cs.slang";
     const char kSharcInvalidateFile[] = "RenderPasses/ReSTIRPTPass/SharcInvalidate.cs.slang";
@@ -35,46 +25,7 @@ namespace
 
 void RTPT::specializeSharc(const Program::DefineList& defines)
 {
-    if (mSharcGenerateStats && !mpSharcGenerateStats)
-        mpSharcGenerateStats = Buffer::createStructured(sizeof(uint32_t), kGenerateCounterCount,
-            Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
-    else if (!mSharcGenerateStats) mpSharcGenerateStats.reset();
-
-    if (mEnableSharc && mSharcGenerateStats)
-    {
-        if (!mpSharcTrainingStats)
-        {
-            const std::array<uint32_t, kTrainingCounterCount> zeros{};
-            mpSharcTrainingStats = Buffer::createStructured(sizeof(uint32_t), kTrainingCounterCount,
-                Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, zeros.data(), false);
-        }
-    }
-    else mpSharcTrainingStats.reset();
-
-    const bool collectTemporal = mSharcGenerateStats && querySharcInTemporal();
-    if (collectTemporal && !mpSharcTemporalStats)
-        mpSharcTemporalStats = Buffer::createStructured(sizeof(uint32_t), kTemporalCounterCount,
-            Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None, nullptr, false);
-    else if (!collectTemporal) mpSharcTemporalStats.reset();
-
-    if (!mEnableSharc)
-    {
-        mpSharcUpdate.reset();
-        mpSharcPGUpdate.reset();
-        mpSharcResolve.reset();
-        mpSharcInvalidate.reset();
-        mpSharcMotionBounds.reset();
-        mpSharcKeys = mpSharcLocks = mpSharcAccumulation = mpSharcResolved = nullptr;
-        mSharcPreviousBounds.clear();
-        mSharcMotionBounds.clear();
-        mSharcNeedsClear = true;
-        mSharcPretrainPending = true;
-        mSharcPretrainedSpp = 0;
-        return;
-    }
     auto updateDefines = defines;
-    updateDefines.add("SHARC_TRAINING", "1");
-    updateDefines.add("SHARC_TRAINING_STATS", mSharcGenerateStats ? "1" : "0");
     updateDefines.add(mpScene->getSceneDefines());
     if (mpEmissiveSampler) updateDefines.add(mpEmissiveSampler->getDefines());
     auto specializeTrainer = [&](ComputePass::SharedPtr& pass, bool collectPG)
@@ -93,15 +44,8 @@ void RTPT::specializeSharc(const Program::DefineList& defines)
             pass->setVars(nullptr);
         }
     };
-    specializeTrainer(mpSharcUpdate, false);
+    if (mEnableSharc) specializeTrainer(mpSharcUpdate, false);
     if (mEnablePG) specializeTrainer(mpSharcPGUpdate, true);
-    else mpSharcPGUpdate.reset();
-    if (!mpSharcResolve)
-    {
-        Program::Desc desc;
-        desc.addShaderLibrary(kSharcResolveFile).csEntry("main").setShaderModel("6_5");
-        mpSharcResolve = ComputePass::create(desc, {}, true);
-    }
 }
 
 void RTPT::bindSharc(const ShaderVar& var) const
@@ -113,11 +57,11 @@ void RTPT::bindSharc(const ShaderVar& var) const
     grid["sceneScale"] = mSharcPublishedGrid.sceneScale;
     grid["levelBias"] = mSharcPublishedGrid.levelBias;
     auto table = cache["hashGridData"];
-    table["capacity"] = kSharcCapacity;
-    table["hashEntriesBuffer"] = mpSharcKeys;
-    table["lockBuffer"] = mpSharcLocks;
-    cache["accumulationBuffer"] = mpSharcAccumulation;
-    cache["resolvedBuffer"] = mpSharcResolved;
+    table["capacity"] = mEnableSharc && mpSharcKeys ? kSharcCapacity : 0u;
+    table["hashEntriesBuffer"] = mEnableSharc ? mpSharcKeys : nullptr;
+    table["lockBuffer"] = mEnableSharc ? mpSharcLocks : nullptr;
+    cache["accumulationBuffer"] = mEnableSharc ? mpSharcAccumulation : nullptr;
+    cache["resolvedBuffer"] = mEnableSharc ? mpSharcResolved : nullptr;
     cache["radianceScale"] = 1000.f;
     var["minRoughness"] = 0.4f;
 }
@@ -125,9 +69,28 @@ void RTPT::bindSharc(const ShaderVar& var) const
 void RTPT::updateSharc(RenderContext* pRenderContext)
 {
     // Called once per displayed frame, including the scene-load and frozen frames.
-    if (mEnablePG) ++mPGRuntimeFrameCount;
-    const bool captureSparsePG = mEnablePG && mPGRuntimeFrameCount % kPGTrainingInterval == 0;
-    if (!mpSharcKeys)
+    const bool firstPGFrame = mEnablePG && ++mPGRuntimeFrameCount == 1;
+    if (!mEnableSharc)
+    {
+        if (mpSharcKeys)
+        {
+            // Clear resource bindings even if PG is disabled or has no work this frame.
+            if (mpSharcUpdate) mpSharcUpdate->setVars(nullptr);
+            if (mpSharcPGUpdate) mpSharcPGUpdate->setVars(nullptr);
+            mpSharcResolve.reset();
+            mpSharcInvalidate.reset();
+            mpSharcMotionBounds.reset();
+            mpSharcKeys = mpSharcLocks = mpSharcAccumulation = mpSharcResolved = nullptr;
+            mSharcMotionBounds.clear();
+        }
+        mSharcNeedsClear = false;
+        if (!mEnablePG)
+        {
+            mSharcPreviousBounds.clear();
+            return;
+        }
+    }
+    else if (!mpSharcKeys)
     {
         const auto flags = Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess;
         mpSharcKeys = Buffer::createStructured(8u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
@@ -136,22 +99,17 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         mpSharcResolved = Buffer::createStructured(16u, kSharcCapacity, flags, Buffer::CpuAccess::None, nullptr, false);
         mSharcNeedsClear = true;
     }
-    if (mSharcFreeze && !mSharcPretrainPending && !mSharcNeedsClear && mSharcMotionBounds.empty()) return;
+    if (mEnableSharc && mSharcPretrainPending && mSharcPretrainedSpp == 0) mSharcNeedsClear = true;
+    const bool sharcStateChanged = mSharcPretrainPending || mSharcNeedsClear || !mSharcMotionBounds.empty();
     // Invalidation uses world-space keys. A frozen grid keeps its last resolved camera/LOD.
-    if (mSharcNeedsClear || !mSharcFreeze) mSharcPublishedGrid.cameraPosition = mpScene->getCamera()->getPosition();
-    const auto buffers = {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved};
-    if (mSharcNeedsClear)
+    if (mEnableSharc && (mSharcNeedsClear || !mSharcFreeze)) mSharcPublishedGrid.cameraPosition = mpScene->getCamera()->getPosition();
+    if (mEnableSharc && mSharcNeedsClear)
     {
         PROFILE("SHaRC Clear");
         ++mSharcClearCount;
         mSharcFrameIndex = 0;
         mSharcMotionBounds.clear();
-        if (mpSharcTrainingStats)
-        {
-            pRenderContext->clearUAV(mpSharcTrainingStats->getUAV().get(), uint4(0));
-            pRenderContext->uavBarrier(mpSharcTrainingStats.get());
-        }
-        for (const auto& buffer : buffers)
+        for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
         {
             pRenderContext->clearUAV(buffer->getUAV().get(), uint4(0));
             pRenderContext->uavBarrier(buffer.get());
@@ -159,7 +117,7 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         mSharcPreviousCamera = mpScene->getCamera()->getPosition();
         mSharcNeedsClear = false;
     }
-    else if (!mSharcMotionBounds.empty())
+    else if (mEnableSharc && !mSharcMotionBounds.empty())
     {
         PROFILE("SHaRC Invalidate");
         ++mSharcInvalidateCount;
@@ -182,52 +140,60 @@ void RTPT::updateSharc(RenderContext* pRenderContext)
         pRenderContext->uavBarrier(mpSharcAccumulation.get());
         pRenderContext->uavBarrier(mpSharcResolved.get());
     }
-    if (mSharcPretrainPending)
+    const uint32_t sharcPretrainSamples = mEnableSharc && mSharcPretrainPending && mSharcPretrainedSpp < mSharcPretrainSpp
+        ? mSharcPretrainSpp - mSharcPretrainedSpp : 0u;
+    const uint32_t pgPretrainSamples = firstPGFrame ? mSharcPretrainSpp : 0u;
+    const uint32_t pretrainSamples = std::max(sharcPretrainSamples, pgPretrainSamples);
+    // Generate sees the published warm-up immediately. A feature enabled mid-scene
+    // only pretrains its own cache, sharing the dispatch when both are pending.
+    for (uint32_t sample = 0; sample < pretrainSamples;)
     {
-        // The upstream V-buffer has the scene's initial pose. Only the training RNG advances.
-        while (mSharcPretrainedSpp < mSharcPretrainSpp)
         {
+            PROFILE(sharcPretrainSamples ? "SHaRC Pretrain" : "PG Pretrain");
+            const uint32_t batchEnd = sample + std::min(pretrainSamples - sample, kSharcPretrainBatchSpp);
+            for (; sample < batchEnd; ++sample)
             {
-                PROFILE("SHaRC Pretrain");
-                const uint32_t batch = std::min(mSharcPretrainSpp - mSharcPretrainedSpp, kSharcPretrainBatchSpp);
-                for (uint32_t i = 0; i < batch; ++i)
+                const bool trainSharc = sample < sharcPretrainSamples;
+                const bool trainPG = sample < pgPretrainSamples;
+                traceSharcTrainingPaths(pRenderContext, 1u, trainSharc, trainPG);
+                if (trainPG) notePGTraining(1u, true);
+                if (trainSharc)
                 {
-                    traceSharcTrainingPaths(pRenderContext, 1u, mEnablePG);
-                    if (mEnablePG) notePGTraining(1u, true);
                     resolveSharcTraining(pRenderContext);
                     ++mSharcPretrainedSpp;
                 }
             }
-            // Bound outstanding GPU work and transient allocations for long pretrains.
-            if (mSharcPretrainedSpp < mSharcPretrainSpp) pRenderContext->flush(true);
         }
-        mSharcPretrainPending = false;
-        if (mSharcPretrainedSpp > 0)
-        {
-            if (mEnablePG) finishPGTraining(pRenderContext, true);
-            return;
-        }
+        // Bound outstanding GPU work and transient allocations for long pretrains.
+        if (sample < pretrainSamples) pRenderContext->flush(true);
     }
-    if (mSharcFreeze)
+    if (mEnableSharc) mSharcPretrainPending = false;
+    if (pgPretrainSamples > 0) finishPGTraining(pRenderContext, true);
+    if (mEnableSharc && mSharcFreeze)
     {
-        ++mSharcPublishedVersion;
+        if (sharcStateChanged && sharcPretrainSamples == 0) ++mSharcPublishedVersion;
         return;
     }
+    const bool trainSharc = mEnableSharc && sharcPretrainSamples == 0;
+    const bool trainPG = mEnablePG && pgPretrainSamples == 0 && mPGRuntimeFrameCount % kPGTrainingInterval == 0;
+    if (!trainSharc && !trainPG) return;
     {
-        PROFILE("SHaRC SparseUpdate");
-        traceSharcTrainingPaths(pRenderContext, kSharcUpdateStride, captureSparsePG);
-        if (captureSparsePG) notePGTraining(kSharcUpdateStride, false);
+        PROFILE(trainSharc ? "SHaRC SparseUpdate" : "PG SparseUpdate");
+        traceSharcTrainingPaths(pRenderContext, kSharcUpdateStride, trainSharc, trainPG);
+        if (trainPG) notePGTraining(kSharcUpdateStride, false);
     }
+    if (trainSharc)
     {
         PROFILE("SHaRC Resolve");
         resolveSharcTraining(pRenderContext);
     }
-    if (captureSparsePG) finishPGTraining(pRenderContext, false);
+    if (trainPG) finishPGTraining(pRenderContext, false);
 }
 
-void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainPG)
+void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t stride, bool trainSharc, bool trainPG)
 {
-    ++mSharcUpdateCount;
+    if (trainSharc) ++mSharcUpdateCount;
+    const uint32_t trainingSample = trainSharc ? mSharcFrameIndex : mPGNextTrainingSample;
     const auto& pass = trainPG ? mpSharcPGUpdate : mpSharcUpdate;
     auto var = pass->getRootVar();
     mpScene->setRaytracingShaderData(pRenderContext, var);
@@ -235,19 +201,35 @@ void RTPT::traceSharcTrainingPaths(RenderContext* pRenderContext, uint32_t strid
     var["gPathTracer"] = mpPathTracerBlock;
     auto cb = var["CB"];
     bindSharc(cb["gSharcWrite"]);
-    cb["gSharcFrameIndex"] = mSharcFrameIndex;
+    cb["gSharcFrameIndex"] = trainingSample;
     cb["gUpdateStride"] = stride;
-    if (mpSharcTrainingStats) var["gSharcTrainingStats"] = mpSharcTrainingStats;
-    if (trainPG) bindPGTraining(cb["gPGWrite"]);
+    if (trainPG)
+    {
+        cb["gTrainSharc"] = uint32_t(trainSharc);
+        bindPGTraining(cb["gPGWrite"]);
+    }
     pass->execute(pRenderContext, uint3(div_round_up(mParams.frameDim, uint2(stride)), 1u));
-    if (mpSharcTrainingStats) pRenderContext->uavBarrier(mpSharcTrainingStats.get());
-    if (trainPG) barrierPGTraining(pRenderContext);
-    for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
-        pRenderContext->uavBarrier(buffer.get());
+    if (trainPG)
+    {
+        mPGLastTrainingSample = trainingSample;
+        mPGNextTrainingSample = std::max(mPGNextTrainingSample, trainingSample + 1);
+        barrierPGTraining(pRenderContext);
+    }
+    if (trainSharc)
+    {
+        for (const auto& buffer : {mpSharcKeys, mpSharcLocks, mpSharcAccumulation, mpSharcResolved})
+            pRenderContext->uavBarrier(buffer.get());
+    }
 }
 
 void RTPT::resolveSharcTraining(RenderContext* pRenderContext)
 {
+    if (!mpSharcResolve)
+    {
+        Program::Desc desc;
+        desc.addShaderLibrary(kSharcResolveFile).csEntry("main").setShaderModel("6_5");
+        mpSharcResolve = ComputePass::create(desc, {}, true);
+    }
     ++mSharcResolveCount;
     auto cb = mpSharcResolve->getRootVar()["PerFrame"];
     bindSharc(cb["gSharc"]);
@@ -287,13 +269,13 @@ void RTPT::trackSharcMotion(bool lightingChanged)
     const bool first = mSharcPreviousBounds.size() != meshes + curves;
     if (!first && !geometryMoved) return;
     mSharcPreviousBounds.resize(meshes + curves);
-    mSharcNeedsClear |= first;
+    mSharcNeedsClear |= first && !mSharcPretrainPending;
     const auto& transforms = animation->getGlobalMatrices();
     auto track = [&](uint32_t index, uint32_t node, const AABB& local)
     {
         if (!first && !animation->isMatrixChanged(node)) return;
         const AABB world = local.transform(transforms[node]);
-        if (!mSharcNeedsClear)
+        if (mEnableSharc && !mSharcNeedsClear)
         {
             AABB swept = world;
             swept.include(mSharcPreviousBounds[index]);
@@ -323,7 +305,7 @@ pybind11::dict RTPT::getSharcStats() const
 {
     uint32_t occupied = 0, valid = 0, lit = 0, invalidValues = 0;
     uint64_t digest = 0;
-    if (mpSharcKeys && mEnableSharc)
+    if (mEnableSharc && mpSharcKeys)
     {
         // SHARC_SH_ENCODING is disabled. Resolved layout is fp16 RGB + sample count, then two packed uints.
         const auto* keys = static_cast<const uint64_t*>(mpSharcKeys->map(Buffer::MapType::Read));
@@ -352,7 +334,7 @@ pybind11::dict RTPT::getSharcStats() const
         mpSharcKeys->unmap();
     }
     pybind11::dict stats;
-    stats["capacity"] = mpSharcKeys && mEnableSharc ? kSharcCapacity : 0u;
+    stats["capacity"] = mEnableSharc && mpSharcKeys ? kSharcCapacity : 0u;
     stats["occupied"] = occupied;
     stats["valid"] = valid;
     stats["lit"] = lit;
@@ -370,91 +352,24 @@ pybind11::dict RTPT::getSharcStats() const
     stats["clears"] = mSharcClearCount;
     stats["invalidations"] = mSharcInvalidateCount;
     stats["lastMotionBounds"] = mSharcMotionBounds.size() / 2;
-    if (mpSharcTrainingStats)
-    {
-        const char* names[kTrainingCounterCount] = {"trainingPaths", "trainingMainRays", "trainingShadowRays",
-            "trainingSurfaceHits", "trainingHashSum", "trainingHashXor"};
-        const auto* counters = static_cast<const uint32_t*>(mpSharcTrainingStats->map(Buffer::MapType::Read));
-        for (uint32_t i = 0; i < kTrainingCounterCount; ++i) stats[names[i]] = counters[i];
-        mpSharcTrainingStats->unmap();
-    }
     return stats;
-}
-
-pybind11::dict RTPT::getSharcGenerateStats() const
-{
-    // Read only when requested by a diagnostic client. Counter storage is cleared once each rendered frame.
-    std::array<uint32_t, kGenerateCounterCount> values{};
-    if (mSharcGenerateStats && mpSharcGenerateStats)
-    {
-        auto data = static_cast<const uint32_t*>(mpSharcGenerateStats->map(Buffer::MapType::Read));
-        std::copy_n(data, values.size(), values.begin());
-        mpSharcGenerateStats->unmap();
-    }
-    pybind11::dict result;
-    const char* names[kGenerateMetricCount] = {"arrived", "eligible", "hits", "positive", "selected", "winners", "black", "explicit"};
-    for (uint32_t metric = 0; metric < kGenerateMetricCount; ++metric)
-    {
-        std::vector<uint32_t> depths(kGenerateDepthCount);
-        for (uint32_t depth = 0; depth < kGenerateDepthCount; ++depth)
-            depths[depth] = values[depth * kGenerateMetricCount + metric];
-        result[names[metric]] = depths;
-    }
-    result["suffixRays"] = std::vector<uint32_t>(values.begin() + kGenerateRayCountOffset, values.end());
-    result["probe"] = pybind11::none();
-    if (values[kGenerateProbeOffset])
-    {
-        const auto* probe = values.data() + kGenerateProbeOffset;
-        auto vectorAt = [&](uint32_t index)
-        {
-            float rgb[3];
-            std::memcpy(rgb, probe + index, sizeof(rgb));
-            return pybind11::make_tuple(rgb[0], rgb[1], rgb[2]);
-        };
-        pybind11::dict sample;
-        sample["pixel"] = pybind11::make_tuple(probe[1], probe[2]);
-        sample["fullThroughput"] = vectorAt(3);
-        sample["suffixThroughput"] = vectorAt(6);
-        sample["radiance"] = vectorAt(9);
-        sample["wi"] = vectorAt(12);
-        sample["seed"] = probe[15];
-        result["probe"] = sample;
-    }
-    return result;
 }
 
 pybind11::bytes RTPT::getSharcFreshReservoirs() const
 {
-    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
-    if (mEnableTemporalReuse || mEnableSpatialReuse)
-        throw std::logic_error("Fresh reservoir readback requires Temporal and Spatial reuse disabled.");
-    return readReservoirs(mpOutputReservoirs);
-}
-
-std::vector<uint32_t> RTPT::getSharcTemporalStats() const
-{
-    std::vector<uint32_t> values(kTemporalCounterCount);
-    if (mSharcGenerateStats && mpSharcTemporalStats)
-    {
-        const auto* data = static_cast<const uint32_t*>(mpSharcTemporalStats->map(Buffer::MapType::Read));
-        std::copy_n(data, values.size(), values.begin());
-        mpSharcTemporalStats->unmap();
-    }
-    return values;
+    if (!mpOutputReservoirs || mReservoirFrameCount == 0) return pybind11::bytes("", 0);
+    throw std::logic_error("Fresh reservoir readback requires a capture before Temporal and Spatial reuse.");
 }
 
 pybind11::bytes RTPT::getSharcTemporalReservoirs() const
 {
-    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
-    if (!mEnableTemporalReuse || mEnableSpatialReuse)
-        throw std::logic_error("Temporal reservoir readback requires Temporal reuse enabled and Spatial reuse disabled.");
-    return readReservoirs(mpOutputReservoirs);
+    if (!mpOutputReservoirs || mReservoirFrameCount == 0) return pybind11::bytes("", 0);
+    throw std::logic_error("Temporal reservoir readback requires a capture before Spatial reuse.");
 }
 
 pybind11::bytes RTPT::getSharcSpatialReservoirs() const
 {
-    if (!mSharcGenerateStats || !mpOutputReservoirs) return pybind11::bytes("", 0);
-    if (!mEnableSpatialReuse) throw std::logic_error("Spatial reservoir readback requires Spatial reuse enabled.");
+    if (!mpOutputReservoirs || mReservoirFrameCount == 0) return pybind11::bytes("", 0);
     // Odd round counts end in the per-sample buffer, even counts in the shared output.
     return readReservoirs(mNumSpatialRounds % 2 ? mpTemporalReservoirs.back() : mpOutputReservoirs);
 }

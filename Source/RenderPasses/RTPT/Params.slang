@@ -6,32 +6,6 @@
 
 BEGIN_NAMESPACE_FALCOR
 
-/** Enumeration of the atomic counters used.
-*/
-enum class Counters
-{
-    // TODO: Better naming
-    kGeneralPaths = 0,
-    kGeneralPathsProcessed,
-    kSpecularPaths,
-    kSpecularPathsProcessed,
-    kDeltaReflectionPaths,
-    kDeltaReflectionPathsProcessed,
-    kDeltaTransmissionPaths,
-    kDeltaTransmissionPathsProcessed,
-
-    kGeneralQueued,
-    kGeneralQueuedProcessed,
-
-    kThreadCountSpecular,
-    kThreadCountGeneral,
-    kThreadCountDeltaReflection,
-    kThreadCountDeltaTransmission,
-
-    // Must be last
-    kCount
-};
-
 /** Per-sample color format.
 */
 enum class ColorFormat

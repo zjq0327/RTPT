@@ -86,23 +86,6 @@ namespace
         { (uint32_t)MISHeuristic::PowerExp, "Power heuristic" },
     };
 
-    const Gui::DropdownList kReSTIRMISList =
-    {
-        { (uint32_t)ReSTIRMISKind::Constant , "Constant resampling MIS (with balance-heuristic contribution MIS)" },
-        { (uint32_t)ReSTIRMISKind::Talbot, "Talbot resampling MIS" },
-        { (uint32_t)ReSTIRMISKind::Pairwise, "Pairwise resampling MIS" },
-        { (uint32_t)ReSTIRMISKind::ConstantBinary, "Constant resampling MIS (with 1/|Z| contribution MIS)" },
-        { (uint32_t)ReSTIRMISKind::ConstantBiased, "Constant resampling MIS (constant contribution MIS, biased)" },
-    };
-
-    const Gui::DropdownList kReSTIRMISList2 =
-    {
-        { (uint32_t)ReSTIRMISKind::Constant , "Constant resampling MIS (with balance-heuristic contribution MIS)" },
-        { (uint32_t)ReSTIRMISKind::Talbot, "Talbot resampling MIS" },
-        { (uint32_t)ReSTIRMISKind::ConstantBinary, "Constant resampling MIS (with 1/|Z| contribution MIS)" },
-        { (uint32_t)ReSTIRMISKind::ConstantBiased, "Constant resampling MIS (constant contribution MIS, biased)" },
-    };
-
     const Gui::DropdownList kSpatialReusePatternList =
     {
         { (uint32_t)SpatialReusePattern::Default, std::string("Default")},
@@ -180,6 +163,9 @@ namespace
     const std::string kTemporalUpdateForDynamicScene = "temporalUpdateForDynamicScene";
     const std::string kEnableRayStats = "enableRayStats";
     const std::string kSharcPretrainSpp = "sharcPretrainSpp";
+    const std::string kAlwaysEnabledOptions[] = {
+        kEnableTemporalReuse, kEnableSpatialReuse, kUseBSDFSampling, "pgSpatialCachePrimary"
+    };
 
     const uint32_t kNeighborOffsetCount = 8192;
 }
@@ -199,43 +185,28 @@ extern "C" __declspec(dllexport) void getPasses(Falcor::RenderPassLibrary & lib)
 
 void RTPT::updateDict(const Dictionary& dict)
 {
-    const bool wasEnabled = mEnableSharc;
     const bool pgWasEnabled = mEnablePG;
-    const bool usedPGGenerateShader = usePGGenerateShader();
+    const bool sharcWasEnabled = mEnableSharc;
     const bool collectedPGStats = mPGGenerateStats;
     const bool collectedPGTemporalStats = mPGTemporalStats;
     const bool collectedPGSpatialStats = mPGSpatialStats;
-    const bool cachedSpatialPrimary = mPGSpatialCachePrimary;
     const float previousPGFraction = mPGDiffuseFraction;
     const float previousPGSceneScale = mPGSceneScale;
-    const bool usedCache = querySharcInGenerate();
-    const bool usedTemporalCache = querySharcInTemporal();
-    const bool collectedStats = mSharcGenerateStats;
-    const uint32_t previousDebugMode = mSharcDebugMode;
-    const uint32_t previousDebugDepth = mSharcDebugDepth;
     const auto trainingSettings = getSharcTrainingSettings();
     bool needToReset = parseDictionary(dict);
-    const size_t sharcOptionCount = size_t(dict.keyExists("enableSHARC")) + size_t(dict.keyExists("sharcFreeze")) +
-        size_t(dict.keyExists("sharcUseCache")) + size_t(dict.keyExists("sharcGenerateStats")) +
-        size_t(dict.keyExists("sharcDebugMode")) + size_t(dict.keyExists("sharcDebugDepth")) +
-        size_t(dict.keyExists("sharcTemporalDebugMode")) + size_t(dict.keyExists("sharcTemporalDebugDepth")) +
-        size_t(dict.keyExists("sharcTemporalUseCache")) + size_t(dict.keyExists(kSharcPretrainSpp)) +
-        size_t(dict.keyExists("enablePG")) + size_t(dict.keyExists("pgSceneScale")) +
+    updateGuidingOptions(pgWasEnabled, sharcWasEnabled);
+    size_t cacheOptionCount = size_t(dict.keyExists("enablePG")) + size_t(dict.keyExists("enableSHARC")) +
+        size_t(dict.keyExists("sharcUseCache")) + size_t(dict.keyExists("sharcTemporalUseCache")) +
+        size_t(dict.keyExists("sharcFreeze")) +
+        size_t(dict.keyExists(kSharcPretrainSpp)) + size_t(dict.keyExists("pgSceneScale")) +
         size_t(dict.keyExists("pgDiffuseFraction")) + size_t(dict.keyExists("pgGenerateStats")) +
-        size_t(dict.keyExists("pgTemporalStats")) + size_t(dict.keyExists("pgSpatialStats")) +
-        size_t(dict.keyExists("pgSpatialCachePrimary"));
-    if (sharcOptionCount && dict.size() == sharcOptionCount)
+        size_t(dict.keyExists("pgTemporalStats")) + size_t(dict.keyExists("pgSpatialStats"));
+    for (const auto& key : kAlwaysEnabledOptions) cacheOptionCount += size_t(dict.keyExists(key));
+    if (cacheOptionCount && dict.size() == cacheOptionCount)
     {
-        const bool queryChanged = usedCache != querySharcInGenerate() || usedTemporalCache != querySharcInTemporal();
-        mRecompile |= wasEnabled != mEnableSharc || queryChanged || collectedStats != mSharcGenerateStats || pgWasEnabled != mEnablePG;
-        mRecompile |= usedPGGenerateShader != usePGGenerateShader() || collectedPGStats != mPGGenerateStats ||
-            collectedPGTemporalStats != mPGTemporalStats || collectedPGSpatialStats != mPGSpatialStats ||
-            cachedSpatialPrimary != mPGSpatialCachePrimary;
-        mOptionsChanged |= (usedPGGenerateShader && previousPGFraction > 0.f) != (usePGGenerateShader() && mPGDiffuseFraction > 0.f);
-        mOptionsChanged |= (usedPGGenerateShader || usePGGenerateShader()) &&
-            (previousPGFraction != mPGDiffuseFraction || pgWasEnabled != mEnablePG || previousPGSceneScale != mPGSceneScale);
-        mOptionsChanged |= queryChanged || previousDebugMode != mSharcDebugMode ||
-            (mSharcDebugMode && previousDebugDepth != mSharcDebugDepth);
+        mRecompile |= collectedPGStats != mPGGenerateStats ||
+            collectedPGTemporalStats != mPGTemporalStats || collectedPGSpatialStats != mPGSpatialStats;
+        mOptionsChanged |= previousPGFraction != mPGDiffuseFraction || previousPGSceneScale != mPGSceneScale;
         return;
     }
     if (needToReset)
@@ -245,9 +216,22 @@ void RTPT::updateDict(const Dictionary& dict)
         mOptionsChanged = true;
         mRecompile = true;
         mParams.frameCount = 0;
-        mAccumulatedShadowRayCount = 0;
-        mAccumulatedClosestHitRayCount = 0;
-        mAccumulatedRayCount = 0;
+    }
+}
+
+void RTPT::updateGuidingOptions(bool pgWasEnabled, bool sharcWasEnabled)
+{
+    if (pgWasEnabled != mEnablePG)
+    {
+        mRecompile = true;
+        mOptionsChanged = true;
+    }
+    if (sharcWasEnabled != mEnableSharc)
+    {
+        mSharcPretrainPending = true;
+        mSharcPretrainedSpp = 0;
+        mRecompile = true;
+        mOptionsChanged = true;
     }
 }
 
@@ -256,23 +240,15 @@ void RTPT::initDict()
     const auto frameDim = mParams.frameDim;
     const auto screenTiles = mParams.screenTiles;
     Init();
-    mEnablePG = false;
+    mEnablePG = true;
+    mEnableSharc = true;
     mPGDiffuseFraction = kDefaultPGDiffuseFraction;
     mPGGenerateStats = false;
     mPGTemporalStats = false;
     mPGSpatialStats = false;
-    mPGSpatialCachePrimary = true;
     mPGSceneScale = kDefaultPGSceneScale;
     releasePG();
-    mEnableSharc = false;
     mSharcFreeze = false;
-    mSharcUseCache = false;
-    mSharcTemporalUseCache = true;
-    mSharcGenerateStats = false;
-    mSharcDebugMode = 0;
-    mSharcDebugDepth = 2;
-    mSharcTemporalDebugMode = 0;
-    mSharcTemporalDebugDepth = 2;
     mSharcNeedsClear = true;
     mSharcPretrainSpp = kDefaultSharcPretrainSpp;
     mSharcPretrainedSpp = 0;
@@ -300,9 +276,7 @@ void RTPT::registerBindings(pybind11::module& m)
     pass.def_property_readonly("pixelStats", &RTPT::getPixelStats);
     pass.def("getSharcStats", &RTPT::getSharcStats);
     pass.def("getPGStats", &RTPT::getPGStats);
-    pass.def("getSharcGenerateStats", &RTPT::getSharcGenerateStats);
     pass.def("getSharcFreshReservoirs", &RTPT::getSharcFreshReservoirs);
-    pass.def("getSharcTemporalStats", &RTPT::getSharcTemporalStats);
     pass.def("getSharcTemporalReservoirs", &RTPT::getSharcTemporalReservoirs);
     pass.def("getSharcSpatialReservoirs", &RTPT::getSharcSpatialReservoirs);
     pass.def("clearSharc", [](RTPT& pt) { pt.mSharcNeedsClear = true; });
@@ -368,34 +342,27 @@ RTPT::RTPT(const Dictionary& dict)
         mpTemporalReusePass = ComputePass::create(desc, defines, false);
     }
 
-    // Allocate resources that don't change in size.
-    mpCounters = Buffer::create((size_t)Counters::kCount * sizeof(uint32_t), Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess, Buffer::CpuAccess::None);
-    mpCountersReadback = Buffer::create((size_t)Counters::kCount * sizeof(uint32_t), Resource::BindFlags::None, Buffer::CpuAccess::Read);
-
     mpPixelStats = PixelStats::create();
     mpPixelDebug = PixelDebug::create(1000);
-
-    mpReadbackFence = GpuFence::create();
 }
 
 bool RTPT::parseDictionary(const Dictionary& dict)
 {
     // Reject incompatible configurations before mutating either the cache or the reuse settings.
-    const auto requested = [&](const char* key, bool current) { return dict.keyExists(key) ? bool(dict[key]) : current; };
-    const bool generateQuery = requested("enableSHARC", mEnableSharc) && requested("sharcUseCache", mSharcUseCache);
-    const bool queryStats = generateQuery && requested("sharcGenerateStats", mSharcGenerateStats);
-    const uint32_t debugMode = dict.keyExists("sharcDebugMode") ? uint32_t(dict["sharcDebugMode"]) : mSharcDebugMode;
-    if (debugMode > 3 || (debugMode && !queryStats))
-        throw std::invalid_argument("sharcDebugMode must be 0, or 1-3 with SHaRC Generate queries and sharcGenerateStats enabled.");
-    const uint32_t temporalDebugMode = dict.keyExists("sharcTemporalDebugMode") ? uint32_t(dict["sharcTemporalDebugMode"]) : mSharcTemporalDebugMode;
-    const bool temporalQueryStats = queryStats && requested("enableTemporalReuse", mEnableTemporalReuse) &&
-        requested("sharcTemporalUseCache", mSharcTemporalUseCache);
-    if (temporalDebugMode > 3 || (temporalDebugMode && !temporalQueryStats))
-        throw std::invalid_argument("sharcTemporalDebugMode must be 0, or 1-3 with Temporal SHaRC queries and sharcGenerateStats enabled.");
-    const uint32_t debugDepth = dict.keyExists("sharcDebugDepth") ? uint32_t(dict["sharcDebugDepth"]) : mSharcDebugDepth;
-    const uint32_t temporalDebugDepth = dict.keyExists("sharcTemporalDebugDepth") ? uint32_t(dict["sharcTemporalDebugDepth"]) : mSharcTemporalDebugDepth;
-    if (debugDepth < 2 || debugDepth > 15 || temporalDebugDepth < 2 || temporalDebugDepth > 15)
-        throw std::invalid_argument("SHaRC diagnostic query depths must be in [2, 15].");
+    for (const auto& key : kAlwaysEnabledOptions)
+    {
+        if (dict.keyExists(key) && !bool(dict[key]))
+            throw std::invalid_argument("RTPT always enables '" + key + "'.");
+    }
+    if (dict.keyExists(kTemporalMisKind) && uint32_t(dict[kTemporalMisKind]) != uint32_t(StaticParams::temporalMisKind))
+        throw std::invalid_argument("RTPT uses Talbot MIS for Temporal reuse.");
+    if (dict.keyExists(kSpatialMisKind) && uint32_t(dict[kSpatialMisKind]) != uint32_t(StaticParams::spatialMisKind))
+        throw std::invalid_argument("RTPT uses Pairwise MIS for Spatial reuse.");
+
+    const bool enableSharc = dict.keyExists("enableSHARC") ? bool(dict["enableSHARC"]) : mEnableSharc;
+    if ((dict.keyExists("sharcUseCache") && bool(dict["sharcUseCache"]) != enableSharc) ||
+        (dict.keyExists("sharcTemporalUseCache") && bool(dict["sharcTemporalUseCache"]) != enableSharc))
+        throw std::invalid_argument("RTPT controls both SHaRC queries with 'enableSHARC'.");
     const uint32_t pretrainSpp = dict.keyExists(kSharcPretrainSpp) ? uint32_t(dict[kSharcPretrainSpp]) : mSharcPretrainSpp;
     const float pgSceneScale = dict.keyExists("pgSceneScale") ? float(dict["pgSceneScale"]) : mPGSceneScale;
     if (!(pgSceneScale > 0.f) || !std::isfinite(pgSceneScale))
@@ -416,7 +383,6 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kLODBias) mParams.lodBias = value;
         else if (key == kSampleGenerator) mStaticParams.sampleGenerator = value;
         else if (key == kFixedSeed) { mParams.fixedSeed = value; mParams.useFixedSeed = true; }
-        else if (key == kUseBSDFSampling) mStaticParams.useBSDFSampling = value;
         else if (key == kUseNEE) mStaticParams.useNEE = value;
         else if (key == kUseMIS) mStaticParams.useMIS = value;
         else if (key == kUseRussianRoulette) mStaticParams.useRussianRoulette = value;
@@ -437,8 +403,6 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kMISPowerExponent) mStaticParams.misPowerExponent = value;
         else if (key == kEmissiveSampler) mStaticParams.emissiveSampler = static_cast<EmissiveLightSamplerType>(static_cast<uint32_t>(value));
         else if (key == kLightBVHOptions) mLightBVHOptions = value;
-        else if (key == kSpatialMisKind) mStaticParams.spatialMisKind = static_cast<ReSTIRMISKind>(static_cast<uint32_t>(value));
-        else if (key == kTemporalMisKind) mStaticParams.temporalMisKind = static_cast<ReSTIRMISKind>(static_cast<uint32_t>(value));
         else if (key == kShiftStrategy)
         {
             if (static_cast<uint32_t>(value) != uint32_t(ShiftMapping::Reconnection))
@@ -453,8 +417,6 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kTemporalHistoryLength) mTemporalHistoryLength = value;
         else if (key == kUseMaxHistory) mUseMaxHistory = value;
         else if (key == kSeedOffset) mSeedOffset = value;
-        else if (key == kEnableTemporalReuse) mEnableTemporalReuse = value;
-        else if (key == kEnableSpatialReuse) mEnableSpatialReuse = value;
         else if (key == kNumSpatialRounds) mNumSpatialRounds = value;
         else if (key == kPathSamplingMode)
         {
@@ -471,26 +433,18 @@ bool RTPT::parseDictionary(const Dictionary& dict)
         else if (key == kUseDirectLighting) mUseDirectLighting = value;
         else if (key == kSeparatePathBSDF) mStaticParams.separatePathBSDF = value;
         else if (key == kCandidateSamples) mStaticParams.candidateSamples = value;
-        else if (key == "enableSHARC") mEnableSharc = value;
         else if (key == "enablePG") mEnablePG = value;
+        else if (key == "enableSHARC") mEnableSharc = enableSharc;
         else if (key == "pgDiffuseFraction") mPGDiffuseFraction = pgFraction;
         else if (key == "pgGenerateStats") mPGGenerateStats = value;
         else if (key == "pgTemporalStats") mPGTemporalStats = value;
         else if (key == "pgSpatialStats") mPGSpatialStats = value;
-        else if (key == "pgSpatialCachePrimary") mPGSpatialCachePrimary = value;
         else if (key == "pgSceneScale")
         {
             mPGResetPending |= mPGSceneScale != pgSceneScale;
             mPGSceneScale = pgSceneScale;
         }
         else if (key == "sharcFreeze") mSharcFreeze = value;
-        else if (key == "sharcUseCache") mSharcUseCache = value;
-        else if (key == "sharcTemporalUseCache") mSharcTemporalUseCache = value;
-        else if (key == "sharcGenerateStats") mSharcGenerateStats = value;
-        else if (key == "sharcDebugMode") mSharcDebugMode = value;
-        else if (key == "sharcDebugDepth") mSharcDebugDepth = debugDepth;
-        else if (key == "sharcTemporalDebugMode") mSharcTemporalDebugMode = temporalDebugMode;
-        else if (key == "sharcTemporalDebugDepth") mSharcTemporalDebugDepth = temporalDebugDepth;
         else if (key == kSharcPretrainSpp) mSharcPretrainSpp = pretrainSpp;
         else if (key == kTemporalUpdateForDynamicScene)
         {
@@ -498,6 +452,8 @@ bool RTPT::parseDictionary(const Dictionary& dict)
             mTemporalUpdateOverride = true;
         }
         else if (key == kEnableRayStats) mEnableRayStats = value;
+        else if (key == kTemporalMisKind || key == kSpatialMisKind || key == "sharcUseCache" || key == "sharcTemporalUseCache" ||
+            std::find(std::begin(kAlwaysEnabledOptions), std::end(kAlwaysEnabledOptions), key) != std::end(kAlwaysEnabledOptions)) continue;
         else logWarning("Unknown field '" + key + "' in RTPT dictionary");
     }
 
@@ -609,7 +565,6 @@ Dictionary RTPT::getScriptingDictionary()
     d[kLODBias] = mParams.lodBias;
     d[kSampleGenerator] = mStaticParams.sampleGenerator;
     if (mParams.useFixedSeed) d[kFixedSeed] = mParams.fixedSeed;
-    d[kUseBSDFSampling] = mStaticParams.useBSDFSampling;
     d[kUseNEE] = mStaticParams.useNEE;
     d[kUseMIS] = mStaticParams.useMIS;
     d[kUseRussianRoulette] = mStaticParams.useRussianRoulette;
@@ -636,8 +591,6 @@ Dictionary RTPT::getScriptingDictionary()
     d[kTemporalHistoryLength] = mTemporalHistoryLength;
     d[kUseMaxHistory] = mUseMaxHistory;
     d[kSeedOffset] = mSeedOffset;
-    d[kEnableTemporalReuse] = mEnableTemporalReuse;
-    d[kEnableSpatialReuse] = mEnableSpatialReuse;
     d[kNumSpatialRounds] = mNumSpatialRounds;
     d[kPathSamplingMode] = uint32_t(PathSamplingMode::ReSTIR);
     d[kEnableTemporalReprojection] = mEnableTemporalReprojection;
@@ -650,39 +603,22 @@ Dictionary RTPT::getScriptingDictionary()
     d[kUseDirectLighting] = mUseDirectLighting;
     d[kSeparatePathBSDF] = mStaticParams.separatePathBSDF;
     d[kCandidateSamples] = mStaticParams.candidateSamples;
-    d["enableSHARC"] = mEnableSharc;
-    d["enablePG"] = mEnablePG;
     d["pgDiffuseFraction"] = mPGDiffuseFraction;
     d["pgGenerateStats"] = mPGGenerateStats;
     d["pgTemporalStats"] = mPGTemporalStats;
     d["pgSpatialStats"] = mPGSpatialStats;
-    d["pgSpatialCachePrimary"] = mPGSpatialCachePrimary;
     d["pgSceneScale"] = mPGSceneScale;
     d["sharcFreeze"] = mSharcFreeze;
-    d["sharcUseCache"] = mSharcUseCache;
-    d["sharcTemporalUseCache"] = mSharcTemporalUseCache;
-    d["sharcGenerateStats"] = mSharcGenerateStats;
-    d["sharcDebugMode"] = mSharcDebugMode;
-    d["sharcDebugDepth"] = mSharcDebugDepth;
-    d["sharcTemporalDebugMode"] = mSharcTemporalDebugMode;
-    d["sharcTemporalDebugDepth"] = mSharcTemporalDebugDepth;
     d[kSharcPretrainSpp] = mSharcPretrainSpp;
     d[kTemporalUpdateForDynamicScene] = mStaticParams.temporalUpdateForDynamicScene;
     d[kEnableRayStats] = mEnableRayStats;
     // Denoising parameters
     d[kUseNRDDemodulation] = mStaticParams.useNRDDemodulation;
-
-    return d;
-}
-
-Dictionary RTPT::getSpecializedScriptingDictionary()
-{
-    Dictionary d;
-    d["pgSpatialCachePrimary"] = mPGSpatialCachePrimary;
-    d[kMaxSurfaceBounces] = mStaticParams.maxSurfaceBounces;
-    d[kSpatialMisKind] = uint32_t(mStaticParams.spatialMisKind);
-    d[kTemporalMisKind] = uint32_t(mStaticParams.temporalMisKind);
-    d[kShiftStrategy] = uint32_t(ShiftMapping::Reconnection);
+    d["enablePG"] = mEnablePG;
+    d["enableSHARC"] = mEnableSharc;
+    d["sharcUseCache"] = mEnableSharc;
+    d["sharcTemporalUseCache"] = mEnableSharc;
+    for (const auto& key : kAlwaysEnabledOptions) d[key] = true;
 
     return d;
 }
@@ -779,67 +715,43 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             preparePathTracer(renderData);
             if (restir_i == 0)
             {
-                if (mEnablePG && (mEnableSharc || mpPGBuildKeys)) preparePG(pRenderContext);
-                else if (!mEnablePG && mpPGBuildKeys) releasePG();
-                if (mEnableSharc) updateSharc(pRenderContext);
-                if (mEnablePG && mpPGBuildKeys && !mPGPublishedThisFrame)
+                if (mEnablePG) preparePG(pRenderContext);
+                else if (mpPGBuildKeys) releasePG();
+                updateSharc(pRenderContext);
+                if (mEnablePG && !mPGPublishedThisFrame)
                 {
                     // Falcor collects the previous frame's timer when it encounters the same event again.
                     PROFILE("PG Publish");
                 }
-                if (mSharcGenerateStats)
-                {
-                    pRenderContext->clearUAV(mpSharcGenerateStats->getUAV().get(), uint4(0));
-                    pRenderContext->uavBarrier(mpSharcGenerateStats.get());
-                    if (mpSharcTemporalStats)
-                    {
-                        pRenderContext->clearUAV(mpSharcTemporalStats->getUAV().get(), uint4(0));
-                        pRenderContext->uavBarrier(mpSharcTemporalStats.get());
-                    }
-                }
             }
-
-            // Reset atomic counters.
-
-            // Clear time output texture.
 
             if (const auto& texture = renderData[kOutputTime])
             {
                 pRenderContext->clearUAV(texture->getUAV().get(), uint4(0));
             }
 
+            mpPathTracerBlock->getRootVar()["gSppId"] = restir_i;
+            mpPathTracerBlock->getRootVar()["gNumSpatialRounds"] = mNumSpatialRounds;
+
+            if (restir_i == 0)
             {
-                assert(mpCounters);
-                pRenderContext->clearUAV(mpCounters->getUAV().get(), uint4(0));
-
-                mpPathTracerBlock->getRootVar()["gSppId"] = restir_i;
-                mpPathTracerBlock->getRootVar()["gNumSpatialRounds"] = mNumSpatialRounds;
-
-                if (restir_i == 0)
-                    // Generate paths at primary hits.
-                    generatePaths(pRenderContext, renderData, 0);
-
-                // Launch main trace pass.
-                tracePass(pRenderContext, renderData, mpTracePass, "tracePass", 0);
+                // Generate paths at primary hits.
+                generatePaths(pRenderContext, renderData, 0);
             }
+
+            tracePass(pRenderContext, renderData, mpTracePass, "tracePass", 0);
         }
 
-        if (mEnableTemporalReuse && mReservoirFrameCount > 0)
-            PathReusePass(pRenderContext, restir_i, renderData, true, 0, !mEnableSpatialReuse);
-        if (mEnableSpatialReuse)
-        {
-            for (int spatialRoundId = 0; spatialRoundId < mNumSpatialRounds; spatialRoundId++)
-                PathReusePass(pRenderContext, restir_i, renderData, false, spatialRoundId, spatialRoundId == mNumSpatialRounds - 1);
-        }
+        if (mReservoirFrameCount > 0)
+            PathReusePass(pRenderContext, restir_i, renderData, true, 0, false);
+        for (int spatialRoundId = 0; spatialRoundId < mNumSpatialRounds; spatialRoundId++)
+            PathReusePass(pRenderContext, restir_i, renderData, false, spatialRoundId, spatialRoundId == mNumSpatialRounds - 1);
 
         if (restir_i == numPasses - 1) mReservoirFrameCount++;
-        if (mEnableTemporalReuse)
-        {
-            if (!mEnableSpatialReuse || mNumSpatialRounds % 2 == 0)
-                pRenderContext->copyResource(mpTemporalReservoirs[restir_i].get(), mpOutputReservoirs.get());
-            if (restir_i == numPasses - 1)
-                pRenderContext->copyResource(mpTemporalVBuffer.get(), renderData[kInputVBuffer].get());
-        }
+        if (mNumSpatialRounds % 2 == 0)
+            pRenderContext->copyResource(mpTemporalReservoirs[restir_i].get(), mpOutputReservoirs.get());
+        if (restir_i == numPasses - 1)
+            pRenderContext->copyResource(mpTemporalVBuffer.get(), renderData[kInputVBuffer].get());
         mParams.seed++;
     }
 
@@ -860,50 +772,30 @@ void RTPT::renderUI(Gui::Widgets& widget)
     dirty |= renderStatsUI(widget);
 
     dirty |= renderDebugUI(widget);
-    if (auto group = widget.group("SHaRC radiance cache"))
+    if (auto group = widget.group("PG and SHaRC"))
     {
-        const bool usedPG = usePGGenerateShader();
-        if (group.checkbox("Enable path guiding", mEnablePG))
+        const bool pgWasEnabled = mEnablePG;
+        const bool sharcWasEnabled = mEnableSharc;
+        group.checkbox("Enable path guiding", mEnablePG);
+        group.checkbox("Enable SHaRC", mEnableSharc);
+        updateGuidingOptions(pgWasEnabled, sharcWasEnabled);
+
+        if (mEnablePG)
         {
-            mRecompile = true;
-            dirty = true;
-        }
-        group.tooltip("Train using SHaRC paths. Guide diffuse paths in Generate, Talbot Temporal, and Pairwise Spatial.");
-        if (mEnablePG && mStaticParams.useBSDFSampling && supportsPGReuse())
-        {
-            const bool samplingChanged = group.var("Diffuse guide fraction", mPGDiffuseFraction, 0.f, 0.999f);
-            mRecompile |= samplingChanged;
-            dirty |= samplingChanged;
-            if (mEnableSpatialReuse)
-                mRecompile |= group.checkbox("Cache primary PG lookups during Spatial", mPGSpatialCachePrimary);
-        }
-        if (mEnablePG && group.var("PG grid scene scale", mPGSceneScale, 0.001f, 1000000.f))
-        {
-            mPGResetPending = true;
-            dirty |= usePGGenerateShader();
-        }
-        if (group.checkbox("Enable SHaRC", mEnableSharc))
-        {
-            mRecompile = true;
-            if (!mEnableSharc)
+            dirty |= group.var("Diffuse guide fraction", mPGDiffuseFraction, 0.f, 0.999f);
+            if (group.var("PG grid scene scale", mPGSceneScale, 0.001f, 1000000.f))
             {
-                dirty |= mSharcUseCache;
-                mSharcUseCache = false;
-                mSharcDebugMode = 0;
-                mSharcTemporalDebugMode = 0;
+                mPGResetPending = true;
+                dirty = true;
             }
         }
-        dirty |= usedPG != usePGGenerateShader();
-        group.var("Scene-load training (spp)", mSharcPretrainSpp);
-        group.tooltip("Training paths per pixel from the starting camera. Changes apply on the next scene load or when the cache is enabled again. Zero skips pretraining.");
+        if (mEnablePG || mEnableSharc)
+        {
+            group.var("Scene-load training (spp)", mSharcPretrainSpp);
+            group.tooltip("Training paths per pixel from the starting camera. Zero skips pretraining.");
+        }
         if (mEnableSharc)
         {
-            if (group.checkbox("Use SHaRC in Generate and Temporal", mSharcUseCache))
-            {
-                mRecompile = true;
-                dirty = true;
-                if (!mSharcUseCache) mSharcDebugMode = mSharcTemporalDebugMode = 0;
-            }
             group.checkbox("Freeze cache updates", mSharcFreeze);
             if (group.button("Clear cache")) mSharcNeedsClear = true;
         }
@@ -972,48 +864,35 @@ bool RTPT::renderRenderingUI(Gui::Widgets& widget)
         if (mParams.rejectShiftBasedOnJacobian)
             dirty |= widget.var("Shift rejection jacobian threshold", mParams.jacobianRejectionThreshold, 0.f, 100.f);
         dirty |= widget.var("Specular roughness threshold", mParams.specularRoughnessThreshold, 0.f, 1.f);
-        dirty |= widget.checkbox("Spatial Reuse", mEnableSpatialReuse);
-        dirty |= widget.checkbox("Temporal Reuse", mEnableTemporalReuse);
-        if (!mEnableTemporalReuse) mSharcTemporalDebugMode = 0;
-
-        if (mEnableSpatialReuse)
+        if (auto group = widget.group("Spatial reuse controls", true))
         {
-            if (auto group = widget.group("Spatial reuse controls", true))
+            dirty |= group.var("Num Spatial Rounds", mNumSpatialRounds, 1, 5);
+            dirty |= group.dropdown("Spatial Reuse Pattern", kSpatialReusePatternList, reinterpret_cast<uint32_t&>(mSpatialReusePattern));
+            dirty |= group.checkbox("Feature-based rejection", mFeatureBasedRejection);
+
+            if (SpatialReusePattern(mSpatialReusePattern) == SpatialReusePattern::SmallWindow)
             {
-                dirty |= widget.var("Num Spatial Rounds", mNumSpatialRounds, 1, 5);
-                dirty |= widget.dropdown("Spatial Reuse Pattern", kSpatialReusePatternList, reinterpret_cast<uint32_t&>(mSpatialReusePattern));
-                dirty |= widget.checkbox("Feature-based rejection", mFeatureBasedRejection);
-
-                if (SpatialReusePattern(mSpatialReusePattern) == SpatialReusePattern::SmallWindow)
-                {
-                    dirty |= widget.var("Window radius", mSmallWindowRestirWindowRadius, 0u, 32u);
-                }
-                else
-                {
-                    dirty |= widget.var("Spatial Neighbor Count", mSpatialNeighborCount, 0, 6);
-                    dirty |= widget.var("Spatial Reuse Radius", mSpatialReuseRadius, 0.f, 100.f);
-                }
-
-                dirty |= widget.dropdown("Spatial Resampling MIS Kind", kReSTIRMISList, reinterpret_cast<uint32_t&>(mStaticParams.spatialMisKind));
+                dirty |= group.var("Window radius", mSmallWindowRestirWindowRadius, 0u, 32u);
+            }
+            else
+            {
+                dirty |= group.var("Spatial Neighbor Count", mSpatialNeighborCount, 0, 6);
+                dirty |= group.var("Spatial Reuse Radius", mSpatialReuseRadius, 0.f, 100.f);
             }
         }
 
-        if (mEnableTemporalReuse)
+        if (auto group = widget.group("Temporal reuse controls", true))
         {
-            if (auto group = widget.group("Temporal reuse controls", true))
+            dirty |= group.var("Temporal History Length", mTemporalHistoryLength, 0, 100);
+            dirty |= group.checkbox("Use M capping", mUseMaxHistory);
+            dirty |= group.checkbox("Temporal Reprojection", mEnableTemporalReprojection);
+            if (group.checkbox("Temporal Update for Dynamic Scenes", mStaticParams.temporalUpdateForDynamicScene))
             {
-                dirty |= widget.var("Temporal History Length", mTemporalHistoryLength, 0, 100);
-                dirty |= widget.checkbox("Use M capping", mUseMaxHistory);
-                dirty |= widget.checkbox("Temporal Reprojection", mEnableTemporalReprojection);
-                if (widget.checkbox("Temporal Update for Dynamic Scenes", mStaticParams.temporalUpdateForDynamicScene))
-                {
-                    mTemporalUpdateOverride = true;
-                    dirty = true;
-                }
-                widget.tooltip("Resample cached radiance in reconnection vertex in temporal reservoir for dynamic scenes (eliminate lags).");
-                dirty |= widget.checkbox("Disable Resampling in Temporal Reuse", mNoResamplingForTemporalReuse);
-                dirty |= widget.dropdown("Temporal Resampling MIS Kind", kReSTIRMISList2, reinterpret_cast<uint32_t&>(mStaticParams.temporalMisKind));
+                mTemporalUpdateOverride = true;
+                dirty = true;
             }
+            group.tooltip("Resample cached radiance in reconnection vertex in temporal reservoir for dynamic scenes (eliminate lags).");
+            dirty |= group.checkbox("Disable Resampling in Temporal Reuse", mNoResamplingForTemporalReuse);
         }
     }
 
@@ -1064,7 +943,6 @@ bool RTPT::renderRenderingUI(Gui::Widgets& widget)
             dirty = true;
         }
 
-        dirty |= widget.checkbox("BSDF importance sampling", mStaticParams.useBSDFSampling);
         widget.tooltip("BSDF importance sampling should normally be enabled.\n\n"
             "If disabled, cosine-weighted hemisphere sampling is used for debugging purposes");
 
@@ -1214,19 +1092,10 @@ void RTPT::updatePrograms()
     if (mRecompile == false) return;
 
     auto defines = mStaticParams.getDefines(*this);
-    defines.add("SHARC_MIN_DEPTH", "2");
     specializeSharc(defines);
-    mpTracePass->addDefine("PG_GENERATE_GUIDING", usePGGenerateShader() ? "1" : "0");
-    mpTracePass->addDefine("PG_GENERATE_STATS", usePGGenerateShader() && mPGGenerateStats ? "1" : "0");
-    mpTemporalReusePass->addDefine("PG_TEMPORAL_GUIDING", usePGTemporalShader() ? "1" : "0");
-    mpTemporalReusePass->addDefine("PG_TEMPORAL_STATS", usePGTemporalShader() && mPGTemporalStats ? "1" : "0");
-    mpSpatialReusePass->addDefine("PG_SPATIAL_GUIDING", usePGSpatialShader() ? "1" : "0");
-    mpSpatialReusePass->addDefine("PG_SPATIAL_STATS", usePGSpatialShader() && mPGSpatialStats ? "1" : "0");
-    mpSpatialReusePass->addDefine("PG_SPATIAL_CACHE_PRIMARY", usePGSpatialShader() && mPGSpatialCachePrimary ? "1" : "0");
-    mpTracePass->addDefine("SHARC_GENERATE_QUERY", querySharcInGenerate() ? "1" : "0");
-    mpTracePass->addDefine("SHARC_GENERATE_STATS", mSharcGenerateStats ? "1" : "0");
-    mpTemporalReusePass->addDefine("SHARC_TEMPORAL_QUERY", querySharcInTemporal() ? "1" : "0");
-    mpTemporalReusePass->addDefine("SHARC_TEMPORAL_STATS", querySharcInTemporal() && mSharcGenerateStats ? "1" : "0");
+    mpTracePass->addDefine("PG_GENERATE_STATS", mEnablePG && mPGGenerateStats ? "1" : "0");
+    mpTemporalReusePass->addDefine("PG_TEMPORAL_STATS", mEnablePG && mPGTemporalStats ? "1" : "0");
+    mpSpatialReusePass->addDefine("PG_SPATIAL_STATS", mEnablePG && mPGSpatialStats ? "1" : "0");
 
     // Update program specialization. This is done through defines in lieu of specialization constants.
     mpGeneratePaths->getProgram()->addDefines(defines);
@@ -1260,7 +1129,7 @@ void RTPT::prepareResources(RenderContext* pRenderContext, const RenderData& ren
                 Resource::BindFlags::ShaderResource | Resource::BindFlags::UnorderedAccess);
         }
     };
-    prepareNRDSurface(mpNRDDeltaDirect, mOutputNRDData && (mEnableTemporalReuse || mEnableSpatialReuse), ResourceFormat::RGBA32Float);
+    prepareNRDSurface(mpNRDDeltaDirect, mOutputNRDData, ResourceFormat::RGBA32Float);
     prepareNRDSurface(mpNRDGuideWeights, mOutputNRDData && mStaticParams.samplesPerPixel > 1, ResourceFormat::RG32Float);
 
     // Compute allocation requirements for paths and output samples.
@@ -1476,7 +1345,7 @@ void RTPT::setShaderData(const ShaderVar& var, const RenderData& renderData, boo
 
     if (isPathTracer)
     {
-        var["isLastRound"] = !mEnableSpatialReuse && (!mEnableTemporalReuse || mReservoirFrameCount == 0);
+        var["isLastRound"] = false;
         var["useDirectLighting"] = mUseDirectLighting;
         var["kUseEnvLight"] = mpScene->useEnvLight();
         var["kUseEmissiveLights"] = mpScene->useEmissiveLights();
@@ -1525,7 +1394,7 @@ bool RTPT::beginFrame(RenderContext* pRenderContext, const RenderData& renderDat
 
     // Update the env map and emissive sampler to the current frame.
     bool lightingChanged = prepareLighting(pRenderContext);
-    if (mEnableSharc) trackSharcMotion(lightingChanged);
+    if (mEnableSharc || mEnablePG) trackSharcMotion(lightingChanged);
 
     // Update refresh flag if changes that affect the output have occured.
     auto& dict = renderData.getDictionary();
@@ -1582,15 +1451,6 @@ void RTPT::endFrame(RenderContext* pRenderContext, const RenderData& renderData)
 {
     mpPixelStats->endFrame(pRenderContext);
     mpPixelDebug->endFrame(pRenderContext);
-
-    if (mEnableRayStats)
-    {
-        PixelStats::Stats stats;
-        mpPixelStats->getStats(stats);
-        mAccumulatedShadowRayCount += (uint64_t)stats.shadowRays;
-        mAccumulatedClosestHitRayCount += (uint64_t)stats.closestHitRays;
-        mAccumulatedRayCount += (uint64_t)stats.totalRays;
-    }
 
     auto copyTexture = [pRenderContext](Texture* pDst, const Texture* pSrc)
     {
@@ -1664,23 +1524,17 @@ void RTPT::tracePass(RenderContext* pRenderContext, const RenderData& renderData
     // Bind the path tracer.
     var["gPathTracer"] = mpPathTracerBlock;
     var["CB"]["gSampleId"] = sampleID;
-    if (usePGGenerateShader())
+    auto pg = var["PGGenerateCB"];
+    bindCurrentPGSampling(pg);
+    if (mEnablePG)
     {
-        auto pg = var["PGGenerateCB"];
-        bindCurrentPGSampling(pg);
         mPGGenerateBoundVersion = mPGSnapshots[mPGCurrent].version;
         if (mPGGenerateStats) pg["pgGenerateCounts"] = mpPGGenerateCounts;
     }
-    if (querySharcInGenerate())
-    {
-        bindSharc(var["CB"]["gSharcQuery"]);
-        if (mSharcGenerateStats)
-        {
-            var["CB"]["gSharcDebugMode"] = mSharcDebugMode;
-            var["CB"]["gSharcDebugDepth"] = mSharcDebugDepth;
-        }
-    }
-    if (mSharcGenerateStats) var["gSharcGenerateStats"] = mpSharcGenerateStats;
+
+    auto sharc = var["GenerateSharcCB"];
+    sharc["gEnableSharcGenerateQuery"] = mEnableSharc;
+    bindSharc(sharc["gSharcQuery"]);
 
     // Launch the threads.
     auto frameDim = renderData.getDefaultTextureDims();
@@ -1702,11 +1556,11 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
 
     // Additional specialization. This shouldn't change resource declarations.
     pass->addDefine("OUTPUT_TIME", mOutputTime ? "1" : "0");
-    pass->addDefine("TEMPORAL_REUSE", isTemporalReuse ? "1" : "0");
     pass->addDefine("OUTPUT_NRD_DATA", mOutputNRDData ? "1" : "0");
 
     // Bind resources.
-    auto var = pass->getRootVar()["CB"]["gPathReusePass"];
+    const auto root = pass->getRootVar();
+    auto var = root["CB"]["gPathReusePass"];
 
     // TODO: refactor arguments
     setShaderData(var, renderData, false, false);
@@ -1716,13 +1570,12 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
 
     var["gNumSpatialRounds"] = mNumSpatialRounds;
 
+    const auto pg = root["PGGenerateCB"];
+    bindCurrentPGSampling(pg);
     if (isTemporalReuse)
     {
-        if (usePGTemporalShader())
+        if (mEnablePG)
         {
-            const auto root = pass->getRootVar();
-            const auto pg = root["PGGenerateCB"];
-            bindCurrentPGSampling(pg);
             mPGTemporalBoundVersion = mPGSnapshots[mPGCurrent].version;
             if (mPGTemporalStats)
             {
@@ -1730,30 +1583,21 @@ void RTPT::PathReusePass(RenderContext* pRenderContext, uint32_t restir_i, const
                 pg["pgTemporalReplayCounts"] = mpPGTemporalReplayCounts;
             }
         }
-        if (querySharcInTemporal())
-        {
-            const auto cb = pass->getRootVar()["TemporalSharcCB"];
-            bindSharc(cb["gSharcTemporalQuery"]);
-            if (mSharcGenerateStats)
-            {
-                cb["gTemporalSharcDebugMode"] = mSharcTemporalDebugMode;
-                cb["gTemporalSharcDebugDepth"] = mSharcTemporalDebugDepth;
-                pass["gSharcTemporalStats"] = mpSharcTemporalStats;
-            }
-        }
+        const auto sharc = root["TemporalSharcCB"];
+        sharc["gEnableSharcTemporalQuery"] = mEnableSharc;
+        bindSharc(sharc["gSharcTemporalQuery"]);
+        const auto& motionVectors = renderData[kInputMotionVectors];
         var["temporalVbuffer"] = mpTemporalVBuffer;
-        var["motionVectors"] = renderData[kInputMotionVectors]->asTexture();
-        var["gEnableTemporalReprojection"] = mEnableTemporalReprojection;
+        var["motionVectors"] = motionVectors ? motionVectors->asTexture() : nullptr;
+        var["gEnableTemporalReprojection"] = mEnableTemporalReprojection && bool(motionVectors);
         var["gNoResamplingForTemporalReuse"] = mNoResamplingForTemporalReuse;
         if (!mUseMaxHistory) var["gTemporalHistoryLength"] = 1e30f;
         else var["gTemporalHistoryLength"] = (float)mTemporalHistoryLength;
     }
     else
     {
-        if (usePGSpatialShader())
+        if (mEnablePG)
         {
-            const auto root = pass->getRootVar();
-            bindCurrentPGSampling(root["PGGenerateCB"]);
             mPGSpatialBoundVersions.push_back(mPGSnapshots[mPGCurrent].version);
             if (mPGSpatialStats) root["pgSpatialCounts"] = mpPGSpatialCounts;
         }

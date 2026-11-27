@@ -14,9 +14,6 @@ import Utils.Sampling.TinyUniformSampleGenerator;
 import Utils.Math.Ray;
 import LoadShadingData;
 import Rendering.Materials.MaterialShading;
-#if SHARC_TEMPORAL_STATS
-import SharcTemporalParams;
-#endif
 
 /** TODO.
 */
@@ -126,13 +123,13 @@ struct PathReusePass
             // color averaging test
 
             // fetch temporal reservoir
-            float2 motionVector = motionVectors[pixel];
             int2 prevPixel = pixel;
 
             bool foundTemporalSurface = true;
 
             if (gEnableTemporalReprojection)
             {
+                float2 motionVector = motionVectors[pixel];
                 prevPixel = pixel + motionVector * params.frameDim + (sampleNext2D(sg) * 1.f - 0.f);
             }
 
@@ -184,7 +181,7 @@ struct PathReusePass
                     else
                     {
 
-                        possibleToBeSelected = shiftAndMergeReservoir(params, doTemporalUpdateForDynamicScene, dstJacobian, centralPrimarySd, tempDstReservoir,
+                        possibleToBeSelected = shiftAndMergeReservoir<1>(params, doTemporalUpdateForDynamicScene, dstJacobian, centralPrimarySd, tempDstReservoir,
                             temporalPrimarySd, temporalReservoir, true, sg, 1.f, true); // "true" means hypothetically selected as the sample
                     }
 
@@ -212,7 +209,7 @@ struct PathReusePass
 
                                 // Fresh already holds its current incident. Only reconnect
                                 // the previous primary surface for this reverse MIS target.
-                                float3 tneighborIntegrand = computeShiftedIntegrand(params, tneighborJacobian, temporalPrimarySd,
+                                float3 tneighborIntegrand = computeShiftedIntegrand<1>(params, tneighborJacobian, temporalPrimarySd,
                                     centralPrimarySd, tempDstReservoir, true, true);
                                 p_ = PathReservoir::toScalar(tneighborIntegrand) * tneighborJacobian;
                                 p_sum += p_ * temporalReservoir.M;
@@ -229,11 +226,6 @@ struct PathReusePass
                         dstReservoir, tempDstReservoir, neighborReservoir, sg, false, misWeight);
 #if PG_TEMPORAL_STATS
                     if (i == prevSampleId && selected) InterlockedAdd(pgTemporalCounts[7], 1u);
-#endif
-#if SHARC_TEMPORAL_STATS
-                    // History is the final candidate, so acceptance here is the published winner.
-                    if (doTemporalUpdateForDynamicScene && i == prevSampleId && selected && dstReservoir.pathFlags.isSharcTerminal())
-                        countSharcTemporalDepth(SharcTemporalDepthStat::Winner, dstReservoir.pathFlags.pathLength());
 #endif
                 }
 
@@ -254,7 +246,7 @@ struct PathReusePass
                 if (gNoResamplingForTemporalReuse)
                     selected = mergeReservoirNoResampling(params, dstReservoir, temporalReservoir, sg);
                 else
-                    selected = shiftAndMergeReservoir(params, doTemporalUpdateForDynamicScene, dstJacobian, centralPrimarySd, dstReservoir,
+                    selected = shiftAndMergeReservoir<1>(params, doTemporalUpdateForDynamicScene, dstJacobian, centralPrimarySd, dstReservoir,
                         temporalPrimarySd, temporalReservoir, true, sg);
 
                 if (selected)
@@ -276,7 +268,7 @@ struct PathReusePass
                         int shiftCount = 1;
                         float prefix_approxPdf;
 
-                        float3 prefixIntegrand = computeShiftedIntegrand(params, prefixJacobian, temporalPrimarySd,
+                        float3 prefixIntegrand = computeShiftedIntegrand<1>(params, prefixJacobian, temporalPrimarySd,
                             centralPrimarySd, dstReservoir, true, true);
                         prefix_approxPdf = PathReservoir::toScalar(prefixIntegrand) * prefixJacobian;
 

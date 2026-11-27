@@ -14,25 +14,14 @@ import Rendering.Utils.PixelStats;
 import Scene.RaytracingInline;
 import Scene.Scene;
 import PathTracer;
+import PGDiffuse;
+import SharcQueryParams;
 import RenderPasses.Shared.Denoising.NRDData;
-#ifndef PG_TEMPORAL_GUIDING
-#define PG_TEMPORAL_GUIDING 0
-#endif
 #ifndef PG_TEMPORAL_STATS
 #define PG_TEMPORAL_STATS 0
 #endif
-#ifndef PG_SPATIAL_GUIDING
-#define PG_SPATIAL_GUIDING 0
-#endif
 #ifndef PG_SPATIAL_STATS
 #define PG_SPATIAL_STATS 0
-#endif
-#ifndef PG_SPATIAL_CACHE_PRIMARY
-#define PG_SPATIAL_CACHE_PRIMARY 0
-#endif
-#define PG_REUSE_GUIDING (PG_TEMPORAL_GUIDING || PG_SPATIAL_GUIDING)
-#if PG_REUSE_GUIDING
-import PGDiffuse;
 #endif
 #if PG_TEMPORAL_STATS
 RWStructuredBuffer<uint> pgTemporalCounts;
@@ -40,15 +29,6 @@ RWStructuredBuffer<uint> pgTemporalCounts;
 #elif PG_SPATIAL_STATS
 RWStructuredBuffer<uint> pgSpatialCounts;
 #define PG_SHIFT_COUNTS pgSpatialCounts
-#endif
-#ifndef SHARC_TEMPORAL_QUERY
-#define SHARC_TEMPORAL_QUERY 0
-#endif
-#ifndef SHARC_TEMPORAL_STATS
-#define SHARC_TEMPORAL_STATS 0
-#endif
-#if SHARC_TEMPORAL_STATS
-import SharcTemporalParams;
 #endif
 
 ParameterBlock<PathTracer> gPathTracer;
@@ -58,20 +38,17 @@ bool isJacobianInvalid(float Jacobian)
     return Jacobian <= 0.f || isnan(Jacobian) || isinf(Jacobian);
 }
 
-#if PG_REUSE_GUIDING
 // Only the diffuse-reflection term changes. A sampled S component needs the
 // proposal table only if the caller also consumes the full NEE competitor.
-float4 lookupReuseScatterMass(inout float4 cachedMass, bool centerPrimary, ShadingData sd, uint lobes, bool needMarginal,
+float4 lookupReuseScatterMass<let IsTemporalReuse : int>(inout float4 cachedMass, bool centerPrimary, ShadingData sd, uint lobes, bool needMarginal,
     bool reverseEvaluation, uint scatterDepth = 0u)
 {
     if (pgDiffuseFraction == 0.f || (!needMarginal && (lobes & uint(SampledBSDFFlags::DiffuseReflection)) == 0u))
         return 0.f;
     float4 mass;
-#if PG_SPATIAL_GUIDING && PG_SPATIAL_CACHE_PRIMARY
     // A negative first component is unread. Zero is a cached miss.
-    if (scatterDepth == 0u && cachedMass.x >= 0.f) mass = cachedMass;
+    if (IsTemporalReuse == 0 && scatterDepth == 0u && cachedMass.x >= 0.f) mass = cachedMass;
     else
-#endif
     {
 #if PG_SPATIAL_STATS
         bool requestedGrid;
@@ -80,9 +57,7 @@ float4 lookupReuseScatterMass(inout float4 cachedMass, bool centerPrimary, Shadi
 #else
         mass = lookupDiffusePG(sd);
 #endif
-#if PG_SPATIAL_GUIDING && PG_SPATIAL_CACHE_PRIMARY
-        if (scatterDepth == 0u) cachedMass = mass;
-#endif
+        if (IsTemporalReuse == 0 && scatterDepth == 0u) cachedMass = mass;
     }
 #if PG_TEMPORAL_STATS || PG_SPATIAL_STATS
     if (any(mass > 0.f)) InterlockedAdd(PG_SHIFT_COUNTS[reverseEvaluation ? 3u : 2u], 1u);
@@ -90,24 +65,24 @@ float4 lookupReuseScatterMass(inout float4 cachedMass, bool centerPrimary, Shadi
     return mass;
 }
 
-float evalReuseScatterPdf(inout float4 cachedMass, bool centerPrimary, ShadingData sd, float3 wi, uint lobes, bool needMarginal,
+float evalReuseScatterPdf<let IsTemporalReuse : int>(inout float4 cachedMass, bool centerPrimary, ShadingData sd, float3 wi,
+    uint lobes, bool needMarginal,
     bool reverseEvaluation, out float pdfAll, uint scatterDepth = 0u)
 {
-    float4 mass = lookupReuseScatterMass(cachedMass, centerPrimary, sd, lobes, needMarginal, reverseEvaluation, scatterDepth);
+    float4 mass = lookupReuseScatterMass<IsTemporalReuse>(cachedMass, centerPrimary, sd, lobes, needMarginal, reverseEvaluation, scatterDepth);
     return evalPdfWithDiffusePG(sd, wi, mass, pdfAll, lobes);
 }
 
-float evalReuseScatterPdf(ShadingData sd, float3 wi, uint lobes, bool needMarginal,
+float evalReuseScatterPdf<let IsTemporalReuse : int>(ShadingData sd, float3 wi, uint lobes, bool needMarginal,
     bool reverseEvaluation, out float pdfAll, uint scatterDepth = 0u)
 {
     float4 unread = -1.f;
-    return evalReuseScatterPdf(unread, false, sd, wi, lobes, needMarginal, reverseEvaluation, pdfAll, scatterDepth);
+    return evalReuseScatterPdf<IsTemporalReuse>(unread, false, sd, wi, lobes, needMarginal, reverseEvaluation, pdfAll, scatterDepth);
 }
-#endif
 
 // dstPdf * dstJacobian transforms pdf in dst space to src space
 // srcPdf / dstJacobian transforms pdf in src space to dst space
-float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 srcMass,
+float3 computeShiftedIntegrandReconnection<let IsTemporalReuse : int>(inout float4 dstMass, inout float4 srcMass,
                                 const RestirPathTracerParams params, inout float dstJacobian, ShadingData dstPrimarySd,
                                 ShadingData srcPrimarySd, inout PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation)
 {
@@ -135,23 +110,26 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
         {
             float3 wi = rcVertexWi;
             bool isVisible = evalSegmentVisibility(dstOrigin, wi, true); // test along a direction
-#if SHARC_TEMPORAL_STATS
-            if (reverseEvaluation)
-                countSharcTemporal(isVisible ? SharcTemporalStat::ReverseVisible : SharcTemporalStat::ReverseOccluded);
-#endif
             if (isVisible)
             {
                 float dstPDF1All;
-#if PG_REUSE_GUIDING
-                float unused;
-                float srcPDF1 = pgDiffuseFraction > 0.f
-                    ? evalReuseScatterPdf(srcMass, reverseEvaluation, srcPrimarySd, wi, allowedSampledTypes1, false, reverseEvaluation, unused)
-                    : evalPdfBSDF(srcPrimarySd, wi);
-                float dstPDF1 = evalReuseScatterPdf(dstMass, !reverseEvaluation, dstPrimarySd, wi, allowedSampledTypes1, true, reverseEvaluation, dstPDF1All);
-#else
-                float srcPDF1 = evalPdfBSDF(srcPrimarySd, wi);
-                float dstPDF1 = evalPdfBSDF(dstPrimarySd, wi, dstPDF1All, allowedSampledTypes1);
-#endif
+                float srcPDF1;
+                float dstPDF1;
+                if (pgEnabled)
+                {
+                    float unused;
+                    srcPDF1 = pgDiffuseFraction > 0.f
+                        ? evalReuseScatterPdf<IsTemporalReuse>(srcMass, reverseEvaluation, srcPrimarySd, wi,
+                            allowedSampledTypes1, false, reverseEvaluation, unused)
+                        : evalPdfBSDF(srcPrimarySd, wi);
+                    dstPDF1 = evalReuseScatterPdf<IsTemporalReuse>(dstMass, !reverseEvaluation, dstPrimarySd, wi,
+                        allowedSampledTypes1, true, reverseEvaluation, dstPDF1All);
+                }
+                else
+                {
+                    srcPDF1 = evalPdfBSDF(srcPrimarySd, wi);
+                    dstPDF1 = evalPdfBSDF(dstPrimarySd, wi, dstPDF1All, allowedSampledTypes1);
+                }
                 float3 dstF1 = evalBSDFCosine(dstPrimarySd, wi, allowedSampledTypes1);
                 float misWeight = PathTracer::evalMIS(1, dstPDF1All, 1, srcReservoir.lightPdf);//   dstPDF1 / (dstPDF1 + srcReservoir.lightPdf);
                 dstIntegrand = dstF1 / dstPDF1 * misWeight * rcVertexIrradiance;
@@ -176,11 +154,7 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
     // delta bounce before/after rcVertex (if isRcVertexNEE, deltaAfterRc won't be set)
     if (isDelta1 || isDelta2) return 0.f;
 
-#if PG_REUSE_GUIDING
-    float rcLod = pgDiffuseFraction > 0.f ? params.lodBias : 0.f;
-#else
-    float rcLod = 0.f;
-#endif
+    float rcLod = pgEnabled && pgDiffuseFraction > 0.f ? params.lodBias : 0.f;
     ShadingData rcVertexSd = loadShadingDataWithPrevVertexPosition(rcVertexHit, dstOrigin, false, rcLod);
 
     // need to evaluate source PDF of BSDF sampling
@@ -201,26 +175,29 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
     // assuming BSDF sampling
     assert(kUseBSDFSampling);
 
-#if PG_REUSE_GUIDING
-    float4 dstGuideMass = lookupReuseScatterMass(dstMass, !reverseEvaluation, dstPrimarySd, allowedSampledTypes1,
-        isRcVertexEscapedVertex, reverseEvaluation);
-#endif
     float3 dstWoLocal = dstPrimarySd.toLocal(dstPrimarySd.V);
     float3 dstWiLocal = dstPrimarySd.toLocal(dstConnectionV);
     FalcorBSDF dstBSDF;
     dstBSDF.setup(dstPrimarySd);
 
     float dstPDF1All = 0.f;
-#if PG_REUSE_GUIDING
-    float dstPDF1 = evalPdfWithDiffusePG(dstBSDF, dstPrimarySd, dstConnectionV, dstWoLocal, dstWiLocal, dstGuideMass,
-        dstPDF1All, allowedSampledTypes1);
-    float unused;
-    float srcPDF1 = evalReuseScatterPdf(srcMass, reverseEvaluation, srcPrimarySd, srcConnectionV, allowedSampledTypes1,
-        false, reverseEvaluation, unused);
-#else
-    float dstPDF1 = dstBSDF.evalPdfAll(dstWoLocal, dstWiLocal, dstPDF1All, allowedSampledTypes1);
-    float srcPDF1 = evalPdfBSDF(srcPrimarySd, srcConnectionV, allowedSampledTypes1); //
-#endif
+    float dstPDF1;
+    float srcPDF1;
+    if (pgEnabled)
+    {
+        float4 dstGuideMass = lookupReuseScatterMass<IsTemporalReuse>(dstMass, !reverseEvaluation, dstPrimarySd,
+            allowedSampledTypes1, isRcVertexEscapedVertex, reverseEvaluation);
+        dstPDF1 = evalPdfWithDiffusePG(dstBSDF, dstPrimarySd, dstConnectionV, dstWoLocal, dstWiLocal, dstGuideMass,
+            dstPDF1All, allowedSampledTypes1);
+        float unused;
+        srcPDF1 = evalReuseScatterPdf<IsTemporalReuse>(srcMass, reverseEvaluation, srcPrimarySd, srcConnectionV,
+            allowedSampledTypes1, false, reverseEvaluation, unused);
+    }
+    else
+    {
+        dstPDF1 = dstBSDF.evalPdfAll(dstWoLocal, dstWiLocal, dstPDF1All, allowedSampledTypes1);
+        srcPDF1 = evalPdfBSDF(srcPrimarySd, srcConnectionV, allowedSampledTypes1);
+    }
 
     Jacobian *= dstPDF1 / srcPDF1;
 
@@ -237,27 +214,31 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
 
     if (!isRcVertexEscapedVertex)
     {
-#if PG_REUSE_GUIDING
-        bool needsLightMIS = isRcVertexFinal && kUseMIS &&
-            srcReservoir.pathFlags.lightType() != uint(PathTracer::LightSampleType::Analytic);
-        dstRcVertexScatterPdf = evalReuseScatterPdf(rcVertexSd, rcVertexWi, allowedSampledTypes2,
-            needsLightMIS, reverseEvaluation, dstRcVertexScatterPdfAll, rcVertexLength);
-        if (!isRcVertexNEE)
+        if (pgEnabled)
         {
-            ShadingData srcRcSd = rcVertexSd;
-            srcRcSd.V = -srcConnectionV;
-            srcRcSd.NdotV = dot(srcRcSd.N, srcRcSd.V);
-            // Opposite-side and view-adjusted normals require a source-side frame.
-            bool sourceFrontFacing = dot(srcRcSd.faceN, srcRcSd.V) >= 0.f;
-            if (pgDiffuseFraction > 0.f && (kAdjustShadingNormals || sourceFrontFacing != srcRcSd.frontFacing))
-                srcRcSd = loadShadingDataWithPrevVertexPosition(rcVertexHit, srcOrigin, false, rcLod);
-            srcRcVertexScatterPdf = evalReuseScatterPdf(srcRcSd, rcVertexWi, allowedSampledTypes2,
-                false, reverseEvaluation, unused, rcVertexLength);
+            bool needsLightMIS = isRcVertexFinal && kUseMIS &&
+                srcReservoir.pathFlags.lightType() != uint(PathTracer::LightSampleType::Analytic);
+            dstRcVertexScatterPdf = evalReuseScatterPdf<IsTemporalReuse>(rcVertexSd, rcVertexWi, allowedSampledTypes2,
+                needsLightMIS, reverseEvaluation, dstRcVertexScatterPdfAll, rcVertexLength);
+            if (!isRcVertexNEE)
+            {
+                ShadingData srcRcSd = rcVertexSd;
+                srcRcSd.V = -srcConnectionV;
+                srcRcSd.NdotV = dot(srcRcSd.N, srcRcSd.V);
+                // Opposite-side and view-adjusted normals require a source-side frame.
+                bool sourceFrontFacing = dot(srcRcSd.faceN, srcRcSd.V) >= 0.f;
+                if (pgDiffuseFraction > 0.f && (kAdjustShadingNormals || sourceFrontFacing != srcRcSd.frontFacing))
+                    srcRcSd = loadShadingDataWithPrevVertexPosition(rcVertexHit, srcOrigin, false, rcLod);
+                float unused;
+                srcRcVertexScatterPdf = evalReuseScatterPdf<IsTemporalReuse>(srcRcSd, rcVertexWi, allowedSampledTypes2,
+                    false, reverseEvaluation, unused, rcVertexLength);
+            }
         }
-#else
-        dstRcVertexScatterPdf = evalPdfBSDF(rcVertexSd, rcVertexWi, dstRcVertexScatterPdfAll, allowedSampledTypes2);
-        srcRcVertexScatterPdf = evalPdfBSDFWithV(rcVertexSd, -srcConnectionV, rcVertexWi, allowedSampledTypes2);
-#endif
+        else
+        {
+            dstRcVertexScatterPdf = evalPdfBSDF(rcVertexSd, rcVertexWi, dstRcVertexScatterPdfAll, allowedSampledTypes2);
+            srcRcVertexScatterPdf = evalPdfBSDFWithV(rcVertexSd, -srcConnectionV, rcVertexWi, allowedSampledTypes2);
+        }
 
         if (!isRcVertexNEE) dstPDF2 = dstRcVertexScatterPdf;
         else dstPDF2 = srcReservoir.lightPdf;
@@ -307,10 +288,6 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
     if (evalVisibility)
     {
         bool isVisible = evalSegmentVisibility(dstOrigin, rcVertexSd.posW);
-#if SHARC_TEMPORAL_STATS
-        if (reverseEvaluation)
-            countSharcTemporal(isVisible ? SharcTemporalStat::ReverseVisible : SharcTemporalStat::ReverseOccluded);
-#endif
         if (!isVisible)
             return 0.f;
     }
@@ -332,58 +309,41 @@ float3 computeShiftedIntegrandReconnection(inout float4 dstMass, inout float4 sr
     return dstIntegrand;
 }
 
-float3 computeShiftedIntegrandReconnection(const RestirPathTracerParams params, inout float dstJacobian, ShadingData dstPrimarySd,
-    ShadingData srcPrimarySd, inout PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation)
-{
-    float4 dstMass = -1.f, srcMass = -1.f;
-    return computeShiftedIntegrandReconnection(dstMass, srcMass, params, dstJacobian, dstPrimarySd,
-        srcPrimarySd, srcReservoir, evalVisibility, reverseEvaluation);
-}
-
-float3 computeShiftedIntegrand(inout float4 dstMass, inout float4 srcMass,
+float3 computeShiftedIntegrand<let IsTemporalReuse : int>(inout float4 dstMass, inout float4 srcMass,
     const RestirPathTracerParams params, out float dstJacobian, const ShadingData dstPrimarySd,
     const ShadingData srcPrimarySd, PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation = false)
 {
     dstJacobian = 0.f;
     if (srcReservoir.weight == 0.f) return 0.f;
-#if SHARC_TEMPORAL_QUERY
     // A black hit or exhausted depth budget cannot win a connection from either primary.
-    if (srcReservoir.pathFlags.isSharcTerminal() && all(srcReservoir.rcVertexIrradiance[0] == 0.f)) return 0.f;
-#endif
+    if (IsTemporalReuse != 0 && gEnableSharcTemporalQuery && srcReservoir.pathFlags.isSharcTerminal() &&
+        all(srcReservoir.rcVertexIrradiance[0] == 0.f)) return 0.f;
 #if PG_TEMPORAL_STATS || PG_SPATIAL_STATS
     InterlockedAdd(PG_SHIFT_COUNTS[reverseEvaluation ? 1u : 0u], 1u);
 #endif
-    float3 integrand = computeShiftedIntegrandReconnection(dstMass, srcMass, params, dstJacobian, dstPrimarySd, srcPrimarySd, srcReservoir,
-        evalVisibility, reverseEvaluation);
+    float3 integrand = computeShiftedIntegrandReconnection<IsTemporalReuse>(dstMass, srcMass, params, dstJacobian, dstPrimarySd,
+        srcPrimarySd, srcReservoir, evalVisibility, reverseEvaluation);
 #if PG_TEMPORAL_STATS || PG_SPATIAL_STATS
     if (PathReservoir::toScalar(integrand) * dstJacobian > 0.f)
         InterlockedAdd(PG_SHIFT_COUNTS[reverseEvaluation ? 5u : 4u], 1u);
 #endif
-#if SHARC_TEMPORAL_STATS
-    if (reverseEvaluation)
-    {
-        countSharcTemporal(SharcTemporalStat::ReverseEvaluation);
-        countSharcTemporal(PathReservoir::toScalar(integrand) * dstJacobian > 0.f ?
-            SharcTemporalStat::ReversePositive : SharcTemporalStat::ReverseZero);
-    }
-#endif
     return integrand;
 }
 
-float3 computeShiftedIntegrand(const RestirPathTracerParams params, out float dstJacobian, const ShadingData dstPrimarySd,
+float3 computeShiftedIntegrand<let IsTemporalReuse : int>(const RestirPathTracerParams params, out float dstJacobian, const ShadingData dstPrimarySd,
     const ShadingData srcPrimarySd, PathReservoir srcReservoir, bool evalVisibility, bool reverseEvaluation = false)
 {
     float4 dstMass = -1.f, srcMass = -1.f;
-    return computeShiftedIntegrand(dstMass, srcMass, params, dstJacobian, dstPrimarySd, srcPrimarySd,
+    return computeShiftedIntegrand<IsTemporalReuse>(dstMass, srcMass, params, dstJacobian, dstPrimarySd, srcPrimarySd,
         srcReservoir, evalVisibility, reverseEvaluation);
 }
 
-bool shiftAndMergeReservoir(inout float4 dstMass, inout float4 srcMass,
+bool shiftAndMergeReservoir<let IsTemporalReuse : int>(inout float4 dstMass, inout float4 srcMass,
     const RestirPathTracerParams params, bool temporalUpdateForDynamicScene, out float dstJacobian,
     const ShadingData dstPrimarySd, inout PathReservoir dstReservoir, const ShadingData srcPrimarySd, PathReservoir srcReservoir,
     bool evalVisibility, inout SampleGenerator sg, float misWeight = 1.f, bool forceMerge = false)
 {
-    const bool replayHistory = temporalUpdateForDynamicScene && srcReservoir.weight != 0.f;
+    const bool replayHistory = IsTemporalReuse != 0 && temporalUpdateForDynamicScene && srcReservoir.weight != 0.f;
     float survivalJacobian = 1.f;
     if (replayHistory)
     {
@@ -392,14 +352,9 @@ bool shiftAndMergeReservoir(inout float4 dstMass, inout float4 srcMass,
 #endif
         survivalJacobian = gPathTracer.traceTemporalUpdate(dstPrimarySd, srcReservoir);
     }
-    float3 dstIntegrand = computeShiftedIntegrand(dstMass, srcMass, params, dstJacobian, dstPrimarySd, srcPrimarySd, srcReservoir, evalVisibility);
+    float3 dstIntegrand = computeShiftedIntegrand<IsTemporalReuse>(dstMass, srcMass, params, dstJacobian, dstPrimarySd, srcPrimarySd,
+        srcReservoir, evalVisibility);
     dstJacobian *= survivalJacobian;
-#if SHARC_TEMPORAL_STATS
-    if (replayHistory && srcReservoir.pathFlags.isSharcTerminal())
-        countSharcTemporal(PathReservoir::toScalar(dstIntegrand) * dstJacobian > 0.f ?
-            SharcTemporalStat::ForwardPositive : SharcTemporalStat::ForwardZero);
-#endif
-
     bool selected = dstReservoir.merge(dstIntegrand, dstJacobian, srcReservoir, sg, misWeight, forceMerge);
 
     if (forceMerge)
@@ -411,12 +366,12 @@ bool shiftAndMergeReservoir(inout float4 dstMass, inout float4 srcMass,
     return selected;
 }
 
-bool shiftAndMergeReservoir(const RestirPathTracerParams params, bool temporalUpdateForDynamicScene, out float dstJacobian,
+bool shiftAndMergeReservoir<let IsTemporalReuse : int>(const RestirPathTracerParams params, bool temporalUpdateForDynamicScene, out float dstJacobian,
     const ShadingData dstPrimarySd, inout PathReservoir dstReservoir, const ShadingData srcPrimarySd, PathReservoir srcReservoir,
     bool evalVisibility, inout SampleGenerator sg, float misWeight = 1.f, bool forceMerge = false)
 {
     float4 dstMass = -1.f, srcMass = -1.f;
-    return shiftAndMergeReservoir(dstMass, srcMass, params, temporalUpdateForDynamicScene, dstJacobian, dstPrimarySd,
+    return shiftAndMergeReservoir<IsTemporalReuse>(dstMass, srcMass, params, temporalUpdateForDynamicScene, dstJacobian, dstPrimarySd,
         dstReservoir, srcPrimarySd, srcReservoir, evalVisibility, sg, misWeight, forceMerge);
 }
 

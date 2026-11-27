@@ -34,37 +34,10 @@ import PathReservoir;
 __exported import PathState;
 __exported import Params;
 
-#ifndef SHARC_TRAINING
-#define SHARC_TRAINING 0
-#endif
-#ifndef SHARC_GENERATE_QUERY
-#define SHARC_GENERATE_QUERY 0
-#endif
-#ifndef SHARC_GENERATE_STATS
-#define SHARC_GENERATE_STATS 0
-#endif
-#ifndef SHARC_TEMPORAL_QUERY
-#define SHARC_TEMPORAL_QUERY 0
-#endif
-#ifndef SHARC_TEMPORAL_STATS
-#define SHARC_TEMPORAL_STATS 0
-#endif
-#ifndef PG_GENERATE_GUIDING
-#define PG_GENERATE_GUIDING 0
-#endif
-#ifndef PG_TEMPORAL_GUIDING
-#define PG_TEMPORAL_GUIDING 0
-#endif
-#define PG_SCATTER_GUIDING (PG_GENERATE_GUIDING || PG_TEMPORAL_GUIDING)
-#if PG_SCATTER_GUIDING
 import PGDiffuse;
-#endif
-#if SHARC_GENERATE_QUERY || SHARC_GENERATE_STATS
-import TracePassParams;
-#endif
-#if SHARC_TEMPORAL_QUERY
-import SharcTemporalParams;
-#endif
+import SharcQueryParams;
+
+static const uint kSharcMinDepth = 2u;
 
 uint getAllowedBSDFFlags(bool isSpecularBounce)
 {
@@ -305,7 +278,7 @@ struct PathTracer
         \param[in,out] path The path state.
         \return True if a ray was generated, false otherwise.
     */
-    bool generateScatterRay(const ShadingData sd, inout PathState path, float4 pgMass = 0.f)
+    bool generateScatterRay<let UseGuide : int>(const ShadingData sd, inout PathState path, float4 pgMass)
     {
         bool isCurveHit = path.hit.getType() == HitType::Curve;
 
@@ -315,11 +288,10 @@ struct PathTracer
 
         if (kUseBSDFSampling)
         {
-#if PG_SCATTER_GUIDING
-            valid = sampleWithDiffusePG(sd, path.sg, pgMass, !kSeparatePathBSDF, result);
-#else
-            valid = sampleBSDF(sd, path.sg, result, !kSeparatePathBSDF);
-#endif
+            if (UseGuide != 0 && pgEnabled)
+                valid = sampleWithDiffusePG(sd, path.sg, pgMass, !kSeparatePathBSDF, result);
+            else
+                valid = sampleBSDF(sd, path.sg, result, !kSeparatePathBSDF);
         }
         else valid = sampleBSDF_Reference(sd, path.sg, result);
 
@@ -370,10 +342,8 @@ struct PathTracer
 #endif
 
             path.clearEventFlags();
-#if SHARC_TRAINING || SHARC_GENERATE_QUERY || SHARC_TEMPORAL_QUERY
             path.previousRoughness = sd.linearRoughness;
             path.previousDiffuse = result.isLobe(LobeType::DiffuseReflection);
-#endif
 
             // Handle reflection events.
 
@@ -451,6 +421,11 @@ struct PathTracer
         return valid;
     }
 
+    bool generateScatterRay(const ShadingData sd, inout PathState path)
+    {
+        return generateScatterRay<0>(sd, path, 0.f);
+    }
+
     // TODO: support BySampledBSDF replay
     bool generateScatterRayGivenDirection(const ShadingData sd, float3 dir, inout PathState path)
     {
@@ -478,11 +453,7 @@ struct PathTracer
 
                 if (kUseBSDFSampling)
                 {
-#if PG_TEMPORAL_GUIDING
                     result.pdf = evalPdfWithDiffusePG(sd, result.wi, lookupDiffusePG(sd), pdfAll, allowedBSDFFlags);
-#else
-                    result.pdf = evalPdfBSDF(sd, result.wi, pdfAll, allowedBSDFFlags, false);
-#endif
                 }
                 else
                 {
@@ -963,11 +934,7 @@ struct PathTracer
 
         if (all(dir == 0.f))
         {
-#if PG_TEMPORAL_GUIDING
-            valid = generateScatterRay(sd, path, lookupDiffusePG(sd));
-#else
-            valid = generateScatterRay(sd, path);
-#endif
+            valid = generateScatterRay<1>(sd, path, lookupDiffusePG(sd));
         }
         else // generate with given direction
         {
@@ -991,33 +958,23 @@ struct PathTracer
         return loadShadingData(path.hit, -path.dir, path.length == 0, path.length > 0 ? params.lodBias : 0.f);
     }
 
-#if SHARC_TRAINING || SHARC_GENERATE_QUERY || SHARC_TEMPORAL_QUERY
     bool allowsSharcDepth(PathState path)
     {
-        return path.length >= SHARC_MIN_DEPTH && path.length < kMaximumPathLength &&
+        return path.length >= kSharcMinDepth && path.length < kMaximumPathLength &&
             (path.length < 4 || path.previousDiffuse) && !path.isTransmission() && !hasFinishedSurfaceBounces(path);
     }
-#endif
 
-    void handleHit(inout PathState path)
+    void handleHit<let TraceFresh : int>(inout PathState path)
     {
         ShadingData sd = loadPathSurface(path);
         if (handleHomogeneousVolumeExtinction(path, sd)) return;
         if (!handleNestedDielectrics(sd, path)) return;
 
-#if SHARC_GENERATE_STATS
-        if (path.length >= SHARC_MIN_DEPTH) countSharc(path.length, SharcDepthStat::Arrived);
-#endif
-#if SHARC_GENERATE_QUERY
-        if (!path.enableRandomReplay && allowsSharcDepth(path))
+        const bool querySharcGenerate = TraceFresh != 0 && gEnableSharcGenerateQuery;
+        if (querySharcGenerate && allowsSharcDepth(path))
         {
             float3 radiance;
-            bool eligible;
-            bool hit = gSharcQuery.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, radiance, eligible);
-#if SHARC_GENERATE_STATS
-            applySharcDebugMode(path.length, eligible, hit, radiance);
-#endif
-            if (hit)
+            if (gSharcQuery.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, radiance))
             {
                 float3 F = path.getCurrentThp() * radiance;
                 float3 incident = path.thp * radiance;
@@ -1028,40 +985,23 @@ struct PathTracer
                         (path.sharcRootBounces >> 8) & 0xffu, path.sharcRootDiffuseLobe, path.sharcPrimaryCountedDiffuse);
                     path.pathReservoir.cachedJacobian.z = path.russianRoulettePdf / path.sharcRootSurvival;
                 }
-#if SHARC_GENERATE_STATS
-                recordSharcHit(path, F, radiance, selected);
-#endif
                 // Cached radiance covers the remaining path even if an earlier Fresh event wins.
                 path.terminate();
                 return;
             }
         }
-#endif
-#if SHARC_TEMPORAL_QUERY
         // Replay the saved number of scattering events, then query the current surface once.
-        if (path.replaySharc && path.length == path.randomReplayLength)
+        if (TraceFresh == 0 && path.replaySharc && path.length == path.randomReplayLength)
         {
             if (allowsSharcDepth(path))
             {
                 float3 radiance;
-                bool eligible;
-#if SHARC_TEMPORAL_STATS
-                recordSharcTemporalLookup(path.length);
-#endif
-                bool hit = gSharcTemporalQuery.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, radiance, eligible);
-#if SHARC_TEMPORAL_STATS
-                applySharcTemporalProbe(path.length, eligible, hit, radiance);
-#endif
-                if (hit) path.pathReservoir.rcVertexIrradiance[0] = path.thp * radiance;
+                if (gSharcTemporalQuery.lookup(sd, path.origin, path.isDelta(), path.previousDiffuse, path.previousRoughness, radiance))
+                    path.pathReservoir.rcVertexIrradiance[0] = path.thp * radiance;
             }
             path.terminate();
             return;
         }
-#endif
-#if SHARC_GENERATE_STATS
-        if (path.length >= SHARC_MIN_DEPTH) countSharc(path.length, SharcDepthStat::Explicit);
-#endif
-
         logPathVertex();
 
         // Optionally disable emissive lights inside volumes.
@@ -1082,9 +1022,7 @@ struct PathTracer
         // Add emitted radiance.
         // The primary hit is always included, secondary hits only if emissive lights are enabled and the full light contribution hasn't been sampled elsewhere.
         bool computeEmissive = isPrimaryHit || kUseEmissiveLights && (!kUseNEE || kUseMIS || !path.isLightSampled() || !isLightSamplable);
-#if SHARC_TEMPORAL_QUERY
-        if (path.replaySharc) computeEmissive = false;
-#endif
+        if (TraceFresh == 0 && path.replaySharc) computeEmissive = false;
 
         // Disable all constributions to direct illumination if requested. (but we need LDeltaDirect which cannot be sampled by ReSTIR DI)
         if (kDisableDirectIllumination && path.length == 1 && isLightSamplable) computeEmissive = false;
@@ -1161,11 +1099,7 @@ struct PathTracer
         // The available lobes depend on the material.
         uint lobes = getBSDFLobes(sd);
 
-#if PG_SCATTER_GUIDING
         float4 pgMass = lookupDiffusePG(sd);
-#else
-        const float4 pgMass = 0.f;
-#endif
         bool supportsNEE = (lobes & (uint)LobeType::NonDelta) != 0;
 
         // Check if we should apply NEE.
@@ -1187,9 +1121,7 @@ struct PathTracer
         const bool is_rcVertex = path.length == 1;
         if (is_rcVertex)
         {
-#if SHARC_GENERATE_QUERY
-            path.sharcPrimaryCountedDiffuse = path.getBounces(BounceType::Diffuse) > 0u;
-#endif
+            if (querySharcGenerate) path.sharcPrimaryCountedDiffuse = path.getBounces(BounceType::Diffuse) > 0u;
             path.pathBuilder.rcVertexHit.initFromHitInfo(path.hit);
             // daqi: save the scatter PDF as cachedJacobian
             path.pathBuilder.cachedJacobian.x = path.prevScatterPdf;
@@ -1212,11 +1144,9 @@ struct PathTracer
         {
             // generate kNEESamples light samples
             bool drawLight = !path.enableRandomReplay || terminateRandomReplayForNEE;
-#if SHARC_TEMPORAL_QUERY
             // Light samplers can consume a variable number of random values.
             // Sample the light to reproduce the scatter seed, then discard it.
-            drawLight = drawLight || path.replaySharc;
-#endif
+            drawLight = drawLight || (TraceFresh == 0 && path.replaySharc);
             if (sampleLights && drawLight)
             {
                 // cache (NEE sampling) seed for temporal validation (only possible for non early direction reuse since it uses the cachedRandomSeed slot)
@@ -1243,9 +1173,7 @@ struct PathTracer
                     path.setLightSampled(sampleUpperHemisphere, sampleLowerHemisphere);
                 }
 
-#if SHARC_TEMPORAL_QUERY
-                if (path.replaySharc) validSample = false;
-#endif
+                if (TraceFresh == 0 && path.replaySharc) validSample = false;
                 if (validSample)
                 {
                     // Apply MIS weight.
@@ -1254,11 +1182,7 @@ struct PathTracer
 
                     if (kUseMIS && ls.lightType != (uint)LightSampleType::Analytic)
                     {
-#if PG_SCATTER_GUIDING
                         scatterPdf = evalScatterPdfWithDiffusePG(sd, ls.dir, pgMass);
-#else
-                        scatterPdf = evalPdfBSDF(sd, ls.dir);
-#endif
 
                         misWeight *= evalMIS(1, ls.pdf, 1, scatterPdf);
                     }
@@ -1315,9 +1239,7 @@ struct PathTracer
         if (kUseRussianRoulette && path.length >= 1)
         {
             bool skipRouletteTest = path.enableRandomReplay;
-#if SHARC_TEMPORAL_QUERY
-            if (path.replaySharc) skipRouletteTest = false;
-#endif
+            if (TraceFresh == 0 && path.replaySharc) skipRouletteTest = false;
             if (skipRouletteTest)
             {
                 sampleNext1D(path.sg);
@@ -1329,7 +1251,7 @@ struct PathTracer
         }
 
         // Generate the next path segment or terminate.
-        bool valid = generateScatterRay(sd, path, pgMass);
+        bool valid = generateScatterRay<1>(sd, path, pgMass);
 
         // cache seed for temporal validation (only possible for non early direction reuse since it uses the cachedRandomSeed slot)
         if (path.length == path.pathBuilder.rcVertexLength)
@@ -1341,11 +1263,12 @@ struct PathTracer
         if (is_rcVertex && valid)
         {
             path.pathBuilder.rcVertexWi[0] = path.dir;
-#if SHARC_GENERATE_QUERY
-            path.sharcRootBounces = path.bounceCounters;
-            path.sharcRootDiffuseLobe = path.previousDiffuse;
-            path.sharcRootSurvival = path.russianRoulettePdf;
-#endif
+            if (querySharcGenerate)
+            {
+                path.sharcRootBounces = path.bounceCounters;
+                path.sharcRootDiffuseLobe = path.previousDiffuse;
+                path.sharcRootSurvival = path.russianRoulettePdf;
+            }
         }
 
         if (!path.isActive()) return;
@@ -1432,14 +1355,13 @@ struct PathTracer
         path.terminate();
     }
 
-#if SHARC_TEMPORAL_QUERY
     // Reconstruct the saved scatter at x1, including the throughput used for suffix roulette.
     bool restoreSharcReplayX1(ShadingData rcPrevSd, PathReservoir history, out PathState path)
     {
         path = {};
         const ReSTIRPathFlags flags = history.pathFlags;
         HitInfo hit = history.rcVertexHit.getHitInfo();
-        if (flags.rcVertexLength() != 1 || flags.pathLength() < SHARC_MIN_DEPTH || !hit.isValid() ||
+        if (flags.rcVertexLength() != 1 || flags.pathLength() < kSharcMinDepth || !hit.isValid() ||
             flags.decodeIsDeltaEvent(true) || flags.decodeIsDeltaEvent(false)) return false;
 
         float3 primaryOrigin = rcPrevSd.computeNewRayOrigin(!flags.decodeIsTransmissionEvent(true));
@@ -1480,64 +1402,43 @@ struct PathTracer
         path.sg = SampleGenerator(history.rcRandomSeed);
         return true;
     }
-#endif
 
     // Start with the outgoing ray and RNG restored at the reconnection vertex.
     void traceReplaySuffix(inout PathState path)
     {
         while (path.isActive())
         {
-#if SHARC_TEMPORAL_QUERY
             if (path.replaySharc && path.length >= path.randomReplayLength) break;
-#endif
-#if SHARC_TEMPORAL_STATS
-            if (path.replaySharc) recordSharcTemporalRay(path.length + 1);
-#endif
             nextVertex(path);
             if (!path.isHit())
             {
-#if SHARC_TEMPORAL_QUERY
                 if (path.replaySharc) break; // A missing cache endpoint has zero contribution.
-#endif
                 handleMiss(path);
                 break;
             }
-            handleHit(path);
+            handleHit<0>(path);
         }
     }
 
     float traceTemporalUpdate(ShadingData rcPrevSd, inout PathReservoir tempPathReservoir)
     {
         PathState path;
-#if SHARC_TEMPORAL_QUERY
-        bool replaySharc = tempPathReservoir.pathFlags.isSharcTerminal();
+        const bool replaySharc = gEnableSharcTemporalQuery && tempPathReservoir.pathFlags.isSharcTerminal();
         if (replaySharc)
         {
-#if SHARC_TEMPORAL_STATS
-            countSharcTemporalDepth(SharcTemporalDepthStat::Replay, tempPathReservoir.pathFlags.pathLength());
-#endif
             tempPathReservoir.rcVertexIrradiance[0] = 0.f;
             if (!restoreSharcReplayX1(rcPrevSd, tempPathReservoir, path)) return 1.f;
         }
         else
-#endif
         {
-#if SHARC_TEMPORAL_STATS
-            if (tempPathReservoir.pathFlags.lastVertexNEE()) countSharcTemporal(SharcTemporalStat::ExplicitNEE);
-            else if (tempPathReservoir.pathFlags.lightType() == uint(LightSampleType::Emissive)) countSharcTemporal(SharcTemporalStat::ExplicitEmitter);
-            else if (tempPathReservoir.pathFlags.lightType() == uint(LightSampleType::EnvMap)) countSharcTemporal(SharcTemporalStat::ExplicitEnvironment);
-#endif
-
             int rcVertexLength = tempPathReservoir.pathFlags.rcVertexLength();
             float3 previousPosition = rcPrevSd.posW;
             float rcLod = 0.f;
-#if PG_TEMPORAL_GUIDING
-            if (pgDiffuseFraction > 0.f)
+            if (pgEnabled && pgDiffuseFraction > 0.f)
             {
                 previousPosition = rcPrevSd.computeNewRayOrigin(!tempPathReservoir.pathFlags.decodeIsTransmissionEvent(true));
                 rcLod = params.lodBias;
             }
-#endif
             ShadingData rcVertexSd = loadShadingDataWithPrevVertexPosition(tempPathReservoir.rcVertexHit.getHitInfo(), previousPosition, false, rcLod);
 
             //rcVertex is NEE
@@ -1613,7 +1514,6 @@ struct PathTracer
             }
         }
         traceReplaySuffix(path);
-#if SHARC_TEMPORAL_QUERY
         if (replaySharc)
         {
             float3 incident = path.pathReservoir.rcVertexIrradiance[0];
@@ -1624,7 +1524,6 @@ struct PathTracer
             tempPathReservoir.cachedJacobian.z = path.russianRoulettePdf;
             return survivalRatio;
         }
-#endif
         tempPathReservoir.rcVertexIrradiance[0] = path.pathReservoir.rcVertexIrradiance[0];
         tempPathReservoir.lightPdf = path.pathReservoir.lightPdf;
         tempPathReservoir.pathFlags.insertLightType(path.pathReservoir.pathFlags.lightType());

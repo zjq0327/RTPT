@@ -85,7 +85,7 @@ struct PGTrainingPath
             PGTrainingEdge edge = edges[i];
             if (edge.quadrant < 4u)
             {
-                float weight = pgTrainingWeight(tailRaw, edge.density, 1.f);
+                float weight = pgTrainingWeight(tailRaw, edge.density);
                 if (!(weight >= 0.f) || !isfinite(weight)) return;
                 edges[i].density = weight;
             }
